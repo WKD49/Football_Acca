@@ -1,0 +1,13 @@
+# Cached API responses
+.cache/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Environment / secrets
+.env
+*.env
+
+# macOS
+.DS_Store
