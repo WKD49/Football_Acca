@@ -580,6 +580,132 @@ def fetch_competition(
 
 
 # ---------------------------------------------------------------------------
+# European-only fetch
+# Fixtures + odds from The Odds API; form from football-data.org if available.
+# ---------------------------------------------------------------------------
+
+# CL/EL competition codes on football-data.org (finished matches only —
+# upcoming scheduled fixtures require a paid tier)
+_EURO_FD_CODES: Dict[str, str] = {
+    "UCL": "CL",
+    "UEL": "EL",
+}
+
+# 25/6 window — same as domestic, but the pool includes both domestic
+# league results and CL/EL league-phase results combined.
+_EURO_CALC = FormCalculator(long_window=25, short_window=6)
+
+_NEUTRAL_FEATURES = TeamFeatures(
+    home_attack_long=1.0,  home_attack_short=1.0,
+    home_defence_long=1.0, home_defence_short=1.0,
+    away_attack_long=1.0,  away_attack_short=1.0,
+    away_defence_long=1.0, away_defence_short=1.0,
+    strict_validation=False,
+)
+
+# European knockout: fatigue/schedule flags not relevant — always neutral.
+_EURO_SCHED = ScheduleContext(
+    rest_days=7, played_midweek=False,
+    played_europe_midweek=False, between_two_europe_legs=False,
+)
+
+
+def fetch_euro_competition(
+    league_id: str,
+    odds_client: OddsApiClient,
+    odds_sport_key: str,
+    season: int,
+    fd_client: Optional[FootballDataClient] = None,
+    extra_results: Optional[List[dict]] = None,
+    bookmaker_filter: Optional[str] = None,
+) -> List[Tuple[Match, List[Tuple[Market, OddsSnapshot]]]]:
+    """
+    Fetch European knockout fixtures and odds.
+
+    Fixtures + odds: The Odds API.
+
+    Form data: CL/EL league-phase results from football-data.org (if available)
+    combined with domestic league results passed in via extra_results.
+    The merged pool is used with a 25-match window — the same as the domestic
+    model — giving each team a full picture of recent form across competitions.
+
+    Schedule fatigue flags are not applied — all games here are European.
+    """
+    # ── CL/EL form from football-data.org ──────────────────────────────────
+    euro_parsed: List[dict] = []
+    fd_code = _EURO_FD_CODES.get(league_id)
+    if fd_client and fd_code:
+        try:
+            raw_finished = fd_client.get_finished_matches(fd_code, season)
+            euro_parsed = [_EURO_CALC.parse_result(m) for m in raw_finished]
+            euro_parsed = [p for p in euro_parsed if p is not None]
+        except Exception:
+            euro_parsed = []
+
+    # ── Merge with domestic results, giving European games 1.1× weight ──────
+    # Scaling goals by 1.1 means each CL/EL result has slightly more influence
+    # on a team's computed form ratio than a domestic match.
+    euro_weighted = [
+        {**r, "home_goals": r["home_goals"] * 1.1, "away_goals": r["away_goals"] * 1.1}
+        for r in euro_parsed
+    ]
+    parsed = euro_weighted + (extra_results or [])
+    league_home_avg, league_away_avg = _EURO_CALC.league_averages(parsed)
+    has_form = bool(parsed)
+
+    # ── Fixtures + odds from The Odds API ──────────────────────────────────
+    odds_events = odds_client.get_odds(odds_sport_key)
+    output: List[Tuple[Match, List[Tuple[Market, OddsSnapshot]]]] = []
+
+    for ev in odds_events:
+        home = normalise_team_name(ev.get("home_team", ""))
+        away = normalise_team_name(ev.get("away_team", ""))
+
+        try:
+            kickoff = datetime.fromisoformat(
+                ev.get("commence_time", "").replace("Z", "+00:00")
+            )
+        except (ValueError, AttributeError):
+            continue
+
+        if has_form:
+            home_features = _EURO_CALC.compute(home, parsed, league_home_avg, league_away_avg)
+            away_features = _EURO_CALC.compute(away, parsed, league_home_avg, league_away_avg)
+            data_quality = 0.72
+        else:
+            home_features = _NEUTRAL_FEATURES
+            away_features = _NEUTRAL_FEATURES
+            data_quality = 0.60
+
+        match = Match(
+            match_id=ev.get("id", f"{league_id}_{home}_{away}"),
+            league=league_id,
+            kickoff_utc=kickoff,
+            home_team=home,
+            away_team=away,
+            home_features=home_features,
+            away_features=away_features,
+            home_schedule=_EURO_SCHED,
+            away_schedule=_EURO_SCHED,
+            league_data_quality=data_quality,
+        )
+
+        market_odds: List[Tuple[Market, OddsSnapshot]] = []
+        for sel in ("HOME", "DRAW", "AWAY"):
+            snap = best_odds_for_selection(ev, "1X2", sel, bookmaker_filter=bookmaker_filter)
+            if snap:
+                market_odds.append((Market(kind="1X2", selection=sel), snap))
+        for sel in ("OVER", "UNDER"):
+            snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=bookmaker_filter)
+            if snap:
+                market_odds.append((Market(kind="OVER_UNDER", line=2.5, selection=sel), snap))
+
+        output.append((match, market_odds))
+
+    return output
+
+
+# ---------------------------------------------------------------------------
 # Sanity-check runner
 # ---------------------------------------------------------------------------
 

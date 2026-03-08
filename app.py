@@ -172,6 +172,29 @@ else:
 st.divider()
 
 # ---------------------------------------------------------------------------
+# High-scoring games (Over 2.5 value bets only)
+# ---------------------------------------------------------------------------
+st.subheader("⚽ High-scoring game picks  (Over/Under 2.5 goals)")
+
+over_under = [c for c in candidates if c.market.kind == "OVER_UNDER"]
+if not over_under:
+    st.info("No Over/Under value bets found this week.")
+else:
+    for c in over_under:
+        bookie_implied = 1 / c.odds.decimal_odds
+        st.markdown(
+            f"**{c.home_team} vs {c.away_team}** `{c.league}` &nbsp;·&nbsp; "
+            f"{format_selection(c.market)} &nbsp;·&nbsp; "
+            f"Odds **{c.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
+            f"Our estimate: **{c.model_prob:.0%}** &nbsp;·&nbsp; "
+            f"Bookie implies: {bookie_implied:.0%} &nbsp;·&nbsp; "
+            f"Edge: **{c.edge:+.0%}** &nbsp;·&nbsp; "
+            f"{conf_badge(c.confidence)}"
+        )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
 # Straight accumulators
 # ---------------------------------------------------------------------------
 st.subheader(f"🎯 Accumulator suggestions  ({CONSTRAINTS.min_legs}–{CONSTRAINTS.max_legs} legs, all must win)")

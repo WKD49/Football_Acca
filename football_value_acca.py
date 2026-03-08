@@ -378,6 +378,12 @@ LEAGUE_CONFIGS: Dict[str, LeagueConfig] = {
 
     # France Ligue 1 (~2.6 goals/match)
     "LIGUE1":       LeagueConfig("LIGUE1",       base_goal_rate=1.30, home_adv_multiplier=1.06, is_lower_tier=False),
+
+    # UEFA Champions League (~2.7 goals/match; used as European baseline)
+    "UCL":          LeagueConfig("UCL",          base_goal_rate=1.35, home_adv_multiplier=1.06, is_lower_tier=False),
+
+    # UEFA Europa League (~2.8 goals/match; slightly more open than CL)
+    "UEL":          LeagueConfig("UEL",          base_goal_rate=1.40, home_adv_multiplier=1.06, is_lower_tier=False),
 }
 
 
