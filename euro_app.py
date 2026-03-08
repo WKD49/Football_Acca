@@ -36,7 +36,7 @@ from run import (
 # Config
 # ---------------------------------------------------------------------------
 
-EURO_DAYS_AHEAD = 14   # knockout fixtures announced further in advance than domestic
+EURO_DAYS_AHEAD = 14
 
 EURO_COMPETITIONS = [
     ("CL", "UCL", "soccer_uefa_champs_league"),
@@ -90,8 +90,6 @@ def pedigree_label(team: str) -> str:
 # ---------------------------------------------------------------------------
 # Data fetching (cached 30 min)
 # ---------------------------------------------------------------------------
-# Domestic competitions whose results feed the European form window.
-# These cover the clubs most likely to appear in CL/EL knockout rounds.
 _DOMESTIC_FD_CODES = ["PL", "PD", "BL1", "SA", "FL1", "PPL"]
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -99,7 +97,6 @@ def fetch_euro_fixtures(fd_key: str, odds_key: str):
     fd   = FootballDataClient(fd_key)
     odds = OddsApiClient(odds_key)
 
-    # ── Pre-fetch domestic results for form enrichment ─────────────────────
     from data_fetcher import FormCalculator as _FC
     _calc = _FC()
     domestic_parsed: list = []
@@ -110,7 +107,6 @@ def fetch_euro_fixtures(fd_key: str, odds_key: str):
         except Exception:
             pass
 
-    # ── Fetch European fixtures + odds ─────────────────────────────────────
     fixture_counts: dict = {}
     all_fixtures:   list = []
 
@@ -135,10 +131,9 @@ def fetch_euro_fixtures(fd_key: str, odds_key: str):
 def run_model(
     all_fixtures: list,
     first_leg_scores: Dict[str, FirstLegResult],
-) -> Tuple[list, list, list]:
-    """Run EuroMatchModel over all fixtures and return candidates, accas, yankee_pool."""
+) -> Tuple[list, list, list, list]:
+    """Run EuroMatchModel and return candidates, accas, yankee_pool, goal_predictions."""
     now    = datetime.now(timezone.utc)
-    # EuroMatchModel.lambdas() is overridden — European adjustments applied automatically
     model  = EuroMatchModel(LEAGUE_CONFIGS, TEAM_DOMESTIC_LEAGUE, first_leg_scores)
     pricer = MarketPricer(max_goals=10)
 
@@ -159,7 +154,32 @@ def run_model(
         reverse=True,
     )
 
-    return candidates, accas, yankee_pool
+    # Raw goal predictions — all fixtures, no edge filter
+    goal_predictions = []
+    for match, market_odds in all_fixtures:
+        lam = model.lambdas(match)
+        p_over, _ = pricer.p_over_under(lam.lam_home, lam.lam_away, 2.5)
+        over_snap = next(
+            (snap for mkt, snap in market_odds
+             if mkt.kind == "OVER_UNDER" and mkt.selection == "OVER"),
+            None,
+        )
+        comp_label = "Champions League" if match.league == "UCL" else "Europa League"
+        goal_predictions.append({
+            "home":       match.home_team,
+            "away":       match.away_team,
+            "league":     comp_label,
+            "kickoff":    match.kickoff_utc,
+            "lam_home":   lam.lam_home,
+            "lam_away":   lam.lam_away,
+            "pred_total": lam.lam_home + lam.lam_away,
+            "p_over_25":  p_over,
+            "over_odds":  over_snap.decimal_odds if over_snap else None,
+            "over_book":  over_snap.bookmaker if over_snap else None,
+        })
+    goal_predictions.sort(key=lambda x: x["pred_total"], reverse=True)
+
+    return candidates, accas, yankee_pool, goal_predictions
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +244,6 @@ first_leg_scores: Dict[str, FirstLegResult] = {}
 if all_fixtures:
     for match, _ in all_fixtures:
         comp_label = "CL" if match.league == "UCL" else "EL"
-        label = f"{match.home_team} vs {match.away_team} ({comp_label})"
         home_ped = pedigree_label(match.home_team)
         away_ped = pedigree_label(match.away_team)
         col_label, col_h, col_dash, col_a = st.columns([4, 1, 0.3, 1])
@@ -242,7 +261,6 @@ if all_fixtures:
             a = st.number_input("Away", min_value=0, max_value=20, value=0,
                                 key=f"a_{match.match_id}", label_visibility="collapsed")
 
-        # Only record if user changed from default (non-zero total or deliberate 0-0)
         if h > 0 or a > 0:
             first_leg_scores[f"{match.home_team} vs {match.away_team}"] = FirstLegResult(
                 home_scored=h, away_scored=a
@@ -253,132 +271,157 @@ st.divider()
 # ---------------------------------------------------------------------------
 # Run model
 # ---------------------------------------------------------------------------
-candidates, accas, yankee_pool = run_model(all_fixtures, first_leg_scores)
+candidates, accas, yankee_pool, goal_predictions = run_model(all_fixtures, first_leg_scores)
 
-st.subheader(f"📋 Value bets found: {len(candidates)}")
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+tab_value, tab_goals = st.tabs(["📋 Value Bets & Accas", "⚽ High-Scoring Games"])
 
-if not candidates:
-    st.info(
-        "No value bets found. European odds often appear 3–4 days before midweek fixtures. "
-        "Try again Tuesday/Wednesday for that week's games."
-    )
-else:
-    for c in candidates:
-        bookie_implied = 1 / c.odds.decimal_odds
-        comp_label = "Champions League" if c.league == "UCL" else "Europa League"
-        home_ped = pedigree_label(c.home_team)
-        away_ped = pedigree_label(c.away_team)
-        fl = first_leg_scores.get(f"{c.home_team} vs {c.away_team}")
-        fl_note = f"  *(2nd leg — first leg: {fl.home_scored}–{fl.away_scored})*" if fl else ""
-        st.markdown(
-            f"**{c.home_team}**{home_ped} vs **{c.away_team}**{away_ped} `{comp_label}`{fl_note}  \n"
-            f"{format_selection(c.market)} &nbsp;·&nbsp; "
-            f"Odds **{c.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
-            f"Our estimate: **{c.model_prob:.0%}** &nbsp;·&nbsp; "
-            f"Bookie implies: {bookie_implied:.0%} &nbsp;·&nbsp; "
-            f"Edge: **{c.edge:+.0%}** &nbsp;·&nbsp; "
-            f"{conf_badge(c.confidence)}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 1 — Value bets, accas, Yankees
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_value:
+
+    st.subheader(f"📋 Value bets found: {len(candidates)}")
+    if not candidates:
+        st.info(
+            "No value bets found. European odds often appear 3–4 days before midweek fixtures. "
+            "Try again Tuesday/Wednesday for that week's games."
         )
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# High-scoring games (Over/Under 2.5 value bets only)
-# ---------------------------------------------------------------------------
-st.subheader("⚽ High-scoring game picks  (Over/Under 2.5 goals)")
-
-over_under = [c for c in candidates if c.market.kind == "OVER_UNDER"]
-if not over_under:
-    st.info(
-        "Paddy Power doesn't provide Over/Under odds for CL/EL through the odds feed. "
-        "Check their site manually for Over 2.5 prices on any fixtures the model flags."
-    )
-else:
-    for c in over_under:
-        bookie_implied = 1 / c.odds.decimal_odds
-        comp_label = "Champions League" if c.league == "UCL" else "Europa League"
-        st.markdown(
-            f"**{c.home_team} vs {c.away_team}** `{comp_label}` &nbsp;·&nbsp; "
-            f"{format_selection(c.market)} &nbsp;·&nbsp; "
-            f"Odds **{c.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
-            f"Our estimate: **{c.model_prob:.0%}** &nbsp;·&nbsp; "
-            f"Bookie implies: {bookie_implied:.0%} &nbsp;·&nbsp; "
-            f"Edge: **{c.edge:+.0%}** &nbsp;·&nbsp; "
-            f"{conf_badge(c.confidence)}"
-        )
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# Accumulators
-# ---------------------------------------------------------------------------
-st.subheader(f"🎯 Accumulator suggestions  ({EURO_CONSTRAINTS.min_legs}–{EURO_CONSTRAINTS.max_legs} legs)")
-
-if not accas:
-    st.info("Not enough value bets to build an accumulator this week.")
-else:
-    for i, acca in enumerate(accas[:5]):
-        header = (
-            f"Acca #{i+1}  —  **{acca.total_odds:.0f}/1**  "
-            f"({win_prob_label(acca.win_prob)})  —  "
-            f"Confidence: {confidence_label(acca.avg_conf)}"
-        )
-        with st.expander(header, expanded=(i == 0)):
-            for leg in acca.legs:
-                comp_label = "CL" if leg.league == "UCL" else "EL"
-                st.markdown(
-                    f"✦ **{leg.home_team} vs {leg.away_team}** `{comp_label}` &nbsp;·&nbsp; "
-                    f"{format_selection(leg.market)} "
-                    f"@ **{leg.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
-                    f"Our estimate: {leg.model_prob:.0%} &nbsp;·&nbsp; "
-                    f"Edge: {leg.edge:+.0%}"
-                )
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# Yankee / doubles
-# ---------------------------------------------------------------------------
-st.subheader("🃏 Yankee & doubles")
-st.caption(f"Only picks with odds under {YANKEE_MAX_ODDS:.1f} included.")
-
-
-def show_coverage_bet(label: str, num_bets: int, selections: list) -> None:
-    with st.expander(f"{label}  —  {num_bets} bets  (£1/bet = £{num_bets} stake)", expanded=True):
-        for i, c in enumerate(selections, 1):
-            comp_label = "CL" if c.league == "UCL" else "EL"
+    else:
+        for c in candidates:
+            bookie_implied = 1 / c.odds.decimal_odds
+            comp_label = "Champions League" if c.league == "UCL" else "Europa League"
+            home_ped = pedigree_label(c.home_team)
+            away_ped = pedigree_label(c.away_team)
+            fl = first_leg_scores.get(f"{c.home_team} vs {c.away_team}")
+            fl_note = f"  *(2nd leg — first leg: {fl.home_scored}–{fl.away_scored})*" if fl else ""
             st.markdown(
-                f"**{i}. {c.home_team} vs {c.away_team}** `{comp_label}`  \n"
-                f"{format_selection(c.market)} "
-                f"@ **{c.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
-                f"Our estimate: {c.model_prob:.0%} &nbsp;·&nbsp; "
-                f"Edge: {c.edge:+.0%}"
+                f"**{c.home_team}**{home_ped} vs **{c.away_team}**{away_ped} `{comp_label}`{fl_note}  \n"
+                f"{format_selection(c.market)} &nbsp;·&nbsp; "
+                f"Odds **{c.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
+                f"Our estimate: **{c.model_prob:.0%}** &nbsp;·&nbsp; "
+                f"Bookie implies: {bookie_implied:.0%} &nbsp;·&nbsp; "
+                f"Edge: **{c.edge:+.0%}** &nbsp;·&nbsp; "
+                f"{conf_badge(c.confidence)}"
             )
-        odds_list = [c.odds.decimal_odds for c in selections]
-        doubles = sorted([a * b for a, b in combinations(odds_list, 2)], reverse=True)
-        st.markdown(f"**If 2 win** — best double pays: **{doubles[0] - 1:.0f}/1**")
-        if len(odds_list) >= 3:
-            trebles = sorted(
-                [a * b * c for a, b, c in combinations(odds_list, 3)], reverse=True
+
+    st.divider()
+
+    # Accumulators
+    st.subheader(f"🎯 Accumulator suggestions  ({EURO_CONSTRAINTS.min_legs}–{EURO_CONSTRAINTS.max_legs} legs)")
+    if not accas:
+        st.info("Not enough value bets to build an accumulator this week.")
+    else:
+        for i, acca in enumerate(accas[:5]):
+            header = (
+                f"Acca #{i+1}  —  **{acca.total_odds:.0f}/1**  "
+                f"({win_prob_label(acca.win_prob)})  —  "
+                f"Confidence: {confidence_label(acca.avg_conf)}"
             )
-            st.markdown(f"**If 3 win** — best treble pays: **{trebles[0] - 1:.0f}/1**")
-        full = 1.0
-        for o in odds_list:
-            full *= o
-        n = len(selections)
-        st.markdown(f"**If all {n} win** — {n}-fold pays: **{full - 1:.0f}/1**")
+            with st.expander(header, expanded=(i == 0)):
+                for leg in acca.legs:
+                    comp_label = "CL" if leg.league == "UCL" else "EL"
+                    st.markdown(
+                        f"✦ **{leg.home_team} vs {leg.away_team}** `{comp_label}` &nbsp;·&nbsp; "
+                        f"{format_selection(leg.market)} "
+                        f"@ **{leg.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
+                        f"Our estimate: {leg.model_prob:.0%} &nbsp;·&nbsp; "
+                        f"Edge: {leg.edge:+.0%}"
+                    )
+
+    # Yankee / doubles
+    st.subheader("🃏 Yankee & doubles")
+    st.caption(f"Only picks with odds under {YANKEE_MAX_ODDS:.1f} included.")
+
+    def show_coverage_bet(label: str, num_bets: int, selections: list) -> None:
+        with st.expander(f"{label}  —  {num_bets} bets  (£1/bet = £{num_bets} stake)", expanded=True):
+            for i, c in enumerate(selections, 1):
+                comp_label = "CL" if c.league == "UCL" else "EL"
+                st.markdown(
+                    f"**{i}. {c.home_team} vs {c.away_team}** `{comp_label}`  \n"
+                    f"{format_selection(c.market)} "
+                    f"@ **{c.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
+                    f"Our estimate: {c.model_prob:.0%} &nbsp;·&nbsp; "
+                    f"Edge: {c.edge:+.0%}"
+                )
+            odds_list = [c.odds.decimal_odds for c in selections]
+            doubles = sorted([a * b for a, b in combinations(odds_list, 2)], reverse=True)
+            st.markdown(f"**If 2 win** — best double pays: **{doubles[0] - 1:.0f}/1**")
+            if len(odds_list) >= 3:
+                trebles = sorted(
+                    [a * b * c for a, b, c in combinations(odds_list, 3)], reverse=True
+                )
+                st.markdown(f"**If 3 win** — best treble pays: **{trebles[0] - 1:.0f}/1**")
+            full = 1.0
+            for o in odds_list:
+                full *= o
+            n = len(selections)
+            st.markdown(f"**If all {n} win** — {n}-fold pays: **{full - 1:.0f}/1**")
+
+    if len(yankee_pool) >= 4:
+        show_coverage_bet("Yankee", 11, yankee_pool[:4])
+    else:
+        st.info(f"Not enough short-odds picks for a Yankee (need 4, found {len(yankee_pool)}).")
+
+    if len(yankee_pool) >= 5:
+        show_coverage_bet("Super Yankee (Canadian)", 26, yankee_pool[:5])
+
+    st.divider()
+    st.caption(
+        "Separate model from domestic app — applies league strength, pedigree bonuses, and "
+        "two-leg context. Still a mathematical model: no guarantees. Bet responsibly."
+    )
 
 
-if len(yankee_pool) >= 4:
-    show_coverage_bet("Yankee", 11, yankee_pool[:4])
-else:
-    st.info(f"Not enough short-odds picks for a Yankee (need 4, found {len(yankee_pool)}).")
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 2 — High-Scoring Games (raw predictions, no edge filter)
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_goals:
+    st.subheader("⚽ Predicted goal totals — all fixtures")
+    st.caption(
+        "Every fixture ranked by the model's expected total goals. "
+        "No edge filter — you decide what looks interesting. "
+        "Over 2.5 odds are best available from any bookmaker."
+    )
 
-if len(yankee_pool) >= 5:
-    show_coverage_bet("Super Yankee (Canadian)", 26, yankee_pool[:5])
+    if not goal_predictions:
+        st.info("No fixtures loaded yet.")
+    else:
+        for g in goal_predictions:
+            kickoff_str = g["kickoff"].strftime("%-d %b %H:%M")
+            pred = g["pred_total"]
 
-st.divider()
-st.caption(
-    "Separate model from domestic app — applies league strength, pedigree bonuses, and "
-    "two-leg context. Still a mathematical model: no guarantees. Bet responsibly."
-)
+            if pred >= 3.0:
+                indicator = "🔴"
+            elif pred >= 2.6:
+                indicator = "🟠"
+            elif pred >= 2.2:
+                indicator = "🟡"
+            else:
+                indicator = "⚪"
+
+            p_over_str = f"{g['p_over_25']:.0%}"
+
+            if g["over_odds"]:
+                odds_str = f"Over 2.5 @ **{g['over_odds']:.2f}** ({g['over_book']})"
+            else:
+                odds_str = "Over 2.5 odds not available"
+
+            st.markdown(
+                f"{indicator} **{g['home']} vs {g['away']}** `{g['league']}` "
+                f"&nbsp;·&nbsp; {kickoff_str} "
+                f"&nbsp;·&nbsp; Pred goals: **{pred:.2f}** "
+                f"&nbsp;·&nbsp; P(over 2.5): **{p_over_str}** "
+                f"&nbsp;·&nbsp; {odds_str}"
+            )
+
+    st.divider()
+    st.caption(
+        "🔴 ≥ 3.0 predicted goals &nbsp;·&nbsp; "
+        "🟠 2.6–3.0 &nbsp;·&nbsp; "
+        "🟡 2.2–2.6 &nbsp;·&nbsp; "
+        "⚪ < 2.2"
+    )
