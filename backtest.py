@@ -16,6 +16,7 @@ Usage:
 """
 
 import os
+import time
 from datetime import datetime, timezone
 from collections import defaultdict
 
@@ -29,6 +30,7 @@ from football_value_acca import LEAGUE_CONFIGS, MarketPricer, MatchModel, Match,
 # Leagues to backtest (football-data.org code, our league ID)
 LEAGUES = [
     ("PL",  "EPL"),
+    ("ELC", "CHAMP"),
     ("PD",  "LALIGA"),
     ("BL1", "BUNDESLIGA"),
     ("SA",  "SERIEA"),
@@ -36,7 +38,7 @@ LEAGUES = [
     ("PPL", "PRIMEIRA"),
 ]
 
-SEASON = 2025
+SEASONS = [2024, 2025]  # runs both and combines totals
 
 # Only flag a prediction if model probability exceeds this threshold
 # (simulates the confidence filter the live app uses)
@@ -77,17 +79,28 @@ def backtest_league(
     league_id: str,
     model: MatchModel,
     pricer: MarketPricer,
+    season: int = 2025,
 ) -> dict:
     calc = FormCalculator()
 
-    raw = fd.get_finished_matches(comp_code, SEASON)
+    raw = fd.get_finished_matches(comp_code, season)
     all_parsed = [calc.parse_result(m) for m in raw]
     all_parsed = [p for p in all_parsed if p is not None]
     all_parsed.sort(key=lambda r: r["date"])
 
     if len(all_parsed) < MIN_HISTORY:
         print(f"  {league_id}: only {len(all_parsed)} results — skipping")
-        return {}
+        return {}, {}
+
+    # Compute actual outcome frequencies from ALL results in this dataset
+    n = len(all_parsed)
+    actual_baselines = {
+        "1X2_HOME": sum(1 for r in all_parsed if r["home_goals"] > r["away_goals"]) / n,
+        "1X2_DRAW": sum(1 for r in all_parsed if r["home_goals"] == r["away_goals"]) / n,
+        "1X2_AWAY": sum(1 for r in all_parsed if r["away_goals"] > r["home_goals"]) / n,
+        "OVER_2.5": sum(1 for r in all_parsed if r["home_goals"] + r["away_goals"] >= 3) / n,
+        "UNDER_2.5": sum(1 for r in all_parsed if r["home_goals"] + r["away_goals"] < 3) / n,
+    }
 
     stats = defaultdict(lambda: {"flagged": 0, "correct": 0})
 
@@ -154,7 +167,7 @@ def backtest_league(
             if not actual_over:
                 stats["UNDER_2.5"]["correct"] += 1
 
-    return dict(stats)
+    return dict(stats), actual_baselines
 
 
 # ---------------------------------------------------------------------------
@@ -171,38 +184,46 @@ def main():
     model  = MatchModel(LEAGUE_CONFIGS)
     pricer = MarketPricer(max_goals=10)
 
-    print(f"\nBacktest — Season 2025/26  (min model prob: {MIN_MODEL_PROB:.0%})")
+    season_labels = {2024: "2024/25", 2025: "2025/26"}
+    baselines = {"1X2_HOME": "~45%", "1X2_DRAW": "~25%", "1X2_AWAY": "~30%",
+                 "OVER_2.5": "~55%", "UNDER_2.5": "~45%"}
+
+    print(f"\nBacktest — seasons: {', '.join(season_labels.values())}  (min model prob: {MIN_MODEL_PROB:.0%})")
     print(f"Min history before predicting: {MIN_HISTORY} matches\n")
 
     grand_total = defaultdict(lambda: {"flagged": 0, "correct": 0})
 
-    for comp_code, league_id in LEAGUES:
-        print(f"Running {league_id}...")
-        stats = backtest_league(fd, comp_code, league_id, model, pricer)
+    for season in SEASONS:
+        print(f"{'='*60}")
+        print(f"SEASON {season_labels[season]}\n")
 
-        if not stats:
-            continue
+        for comp_code, league_id in LEAGUES:
+            print(f"  {league_id}...")
+            time.sleep(7)  # stay within 10 req/min free tier limit
+            stats, actual_bl = backtest_league(fd, comp_code, league_id, model, pricer, season)
 
-        print(f"\n  {'Market':<12}  {'Flagged':>7}  {'Correct':>7}  {'Hit rate':>9}  {'Baseline':>9}")
-        print(f"  {'':─<12}  {'':─>7}  {'':─>7}  {'':─>9}  {'':─>9}")
+            if not stats:
+                continue
 
-        # Rough baselines (league averages across Europe)
-        baselines = {"1X2_HOME": "~45%", "1X2_DRAW": "~25%", "1X2_AWAY": "~30%",
-                     "OVER_2.5": "~55%", "UNDER_2.5": "~45%"}
+            print(f"\n  {'Market':<12}  {'Flagged':>7}  {'Correct':>7}  {'Hit rate':>9}  {'Actual base':>12}  {'vs Base':>8}")
+            print(f"  {'':─<12}  {'':─>7}  {'':─>7}  {'':─>9}  {'':─>12}  {'':─>8}")
 
-        for market, s in sorted(stats.items()):
-            f, c = s["flagged"], s["correct"]
-            hit = c / f if f else 0
-            bl = baselines.get(market, "—")
-            print(f"  {market:<12}  {f:>7}  {c:>7}  {hit:>8.1%}  {bl:>9}")
-            grand_total[market]["flagged"] += f
-            grand_total[market]["correct"] += c
+            for market, s in sorted(stats.items()):
+                f, c = s["flagged"], s["correct"]
+                hit = c / f if f else 0
+                bl_val = actual_bl.get(market, 0)
+                bl = f"{bl_val:.1%}"
+                diff = hit - bl_val
+                diff_str = f"{diff:+.1%}"
+                print(f"  {market:<12}  {f:>7}  {c:>7}  {hit:>8.1%}  {bl:>12}  {diff_str:>8}")
+                grand_total[market]["flagged"] += f
+                grand_total[market]["correct"] += c
 
-        print()
+            print()
 
-    # Grand totals
+    # Grand totals across both seasons
     print("=" * 60)
-    print("TOTALS ACROSS ALL LEAGUES\n")
+    print(f"TOTALS — BOTH SEASONS, ALL LEAGUES\n")
     print(f"  {'Market':<12}  {'Flagged':>7}  {'Correct':>7}  {'Hit rate':>9}")
     print(f"  {'':─<12}  {'':─>7}  {'':─>7}  {'':─>9}")
     for market, s in sorted(grand_total.items()):

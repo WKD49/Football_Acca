@@ -571,6 +571,9 @@ def fetch_competition(
                     market_odds.append((Market(kind="1X2", selection=sel), snap))
             for sel in ("OVER", "UNDER"):
                 snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=bookmaker_filter)
+                # Fall back to best available if chosen bookmaker doesn't offer totals
+                if snap is None and bookmaker_filter:
+                    snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=None)
                 if snap:
                     market_odds.append((Market(kind="OVER_UNDER", line=2.5, selection=sel), snap))
 
@@ -697,6 +700,9 @@ def fetch_euro_competition(
                 market_odds.append((Market(kind="1X2", selection=sel), snap))
         for sel in ("OVER", "UNDER"):
             snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=bookmaker_filter)
+            # Fall back to best available if chosen bookmaker doesn't offer totals
+            if snap is None and bookmaker_filter:
+                snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=None)
             if snap:
                 market_odds.append((Market(kind="OVER_UNDER", line=2.5, selection=sel), snap))
 
