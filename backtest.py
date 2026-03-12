@@ -17,6 +17,7 @@ Usage:
 
 import os
 import time
+from dotenv import load_dotenv; load_dotenv()
 from datetime import datetime, timezone
 from collections import defaultdict
 

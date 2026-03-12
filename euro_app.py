@@ -12,13 +12,17 @@ This is a SEPARATE model from the domestic app — it applies:
 """
 
 import os
+from dotenv import load_dotenv; load_dotenv()
 from datetime import datetime, timezone
 from itertools import combinations
 from typing import Dict, Optional, Tuple
 
 import streamlit as st
 
-from data_fetcher import FootballDataClient, OddsApiClient, fetch_euro_competition
+from data_fetcher import (
+    FootballDataClient, OddsApiClient, fetch_euro_competition,
+    ApiFootballClient, fetch_api_football_results,
+)
 from football_value_acca import (
     AccaConstraints, CandidateRules, LEAGUE_CONFIGS,
     MarketPricer, OptimiserConfig,
@@ -92,8 +96,14 @@ def pedigree_label(team: str) -> str:
 # ---------------------------------------------------------------------------
 _DOMESTIC_FD_CODES = ["PL", "PD", "BL1", "SA", "FL1", "PPL"]
 
+# Leagues where real form data is available on the free football-data.org tier.
+# Teams from other leagues (e.g. Bundesliga, Serie A, Ligue 1) get neutral/average
+# form features — treat their predictions with extra caution.
+_COVERED_LEAGUES_BASE     = {"EPL", "CHAMP", "LALIGA", "PRIMEIRA"}
+_COVERED_LEAGUES_WITH_AF  = {"EPL", "CHAMP", "LALIGA", "PRIMEIRA", "BUNDESLIGA", "SERIEA", "LIGUE1"}
+
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_euro_fixtures(fd_key: str, odds_key: str):
+def fetch_euro_fixtures(fd_key: str, odds_key: str, af_key: str = ""):
     fd   = FootballDataClient(fd_key)
     odds = OddsApiClient(odds_key)
 
@@ -106,6 +116,11 @@ def fetch_euro_fixtures(fd_key: str, odds_key: str):
             domestic_parsed += [r for r in (_calc.parse_result(m) for m in raw) if r]
         except Exception:
             pass
+
+    # Extra domestic results from API-Football (Bundesliga, Serie A, Ligue 1)
+    if af_key:
+        af = ApiFootballClient(af_key)
+        domestic_parsed += fetch_api_football_results(af, SEASON)
 
     fixture_counts: dict = {}
     all_fixtures:   list = []
@@ -140,6 +155,8 @@ def run_model(
     candidates = []
     for match, market_odds in all_fixtures:
         for market, snap in market_odds:
+            if snap.decimal_odds <= 1.0:
+                continue
             c = build_candidate(match, market, snap, model, pricer, now, EURO_RULES)
             if c:
                 candidates.append(c)
@@ -179,7 +196,14 @@ def run_model(
         })
     goal_predictions.sort(key=lambda x: x["pred_total"], reverse=True)
 
-    return candidates, accas, yankee_pool, goal_predictions
+    # Debug breakdowns — one entry per fixture
+    debug_rows = []
+    for match, _ in all_fixtures:
+        d = model.debug_lambdas(match)
+        comp_label = "CL" if match.league == "UCL" else "EL"
+        debug_rows.append({"match": match, "comp": comp_label, **d})
+
+    return candidates, accas, yankee_pool, goal_predictions, debug_rows
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +214,8 @@ st.caption("Champions League & Europa League — Knockout rounds")
 
 fd_key   = os.environ.get("FOOTBALL_DATA_KEY", "")
 odds_key = os.environ.get("ODDS_API_KEY", "")
+af_key   = os.environ.get("RAPID_API_KEY", "")
+_COVERED_LEAGUES = _COVERED_LEAGUES_WITH_AF if af_key else _COVERED_LEAGUES_BASE
 
 if not fd_key or not odds_key:
     st.error("API keys not set. Run: export FOOTBALL_DATA_KEY=... and export ODDS_API_KEY=...")
@@ -213,7 +239,7 @@ st.info(
 # Fetch fixtures
 # ---------------------------------------------------------------------------
 with st.spinner("Fetching European fixtures and odds..."):
-    fixture_counts, all_fixtures = fetch_euro_fixtures(fd_key, odds_key)
+    fixture_counts, all_fixtures = fetch_euro_fixtures(fd_key, odds_key, af_key)
 
 total_fixtures  = sum(v[0] for v in fixture_counts.values())
 total_with_odds = sum(v[1] for v in fixture_counts.values())
@@ -271,12 +297,12 @@ st.divider()
 # ---------------------------------------------------------------------------
 # Run model
 # ---------------------------------------------------------------------------
-candidates, accas, yankee_pool, goal_predictions = run_model(all_fixtures, first_leg_scores)
+candidates, accas, yankee_pool, goal_predictions, debug_rows = run_model(all_fixtures, first_leg_scores)
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_value, tab_goals = st.tabs(["📋 Value Bets & Accas", "⚽ High-Scoring Games"])
+tab_value, tab_goals, tab_debug = st.tabs(["📋 Value Bets & Accas", "⚽ High-Scoring Games", "🔍 Model Breakdown"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -298,6 +324,16 @@ with tab_value:
             away_ped = pedigree_label(c.away_team)
             fl = first_leg_scores.get(f"{c.home_team} vs {c.away_team}")
             fl_note = f"  *(2nd leg — first leg: {fl.home_scored}–{fl.away_scored})*" if fl else ""
+            # Flag imperfect data
+            home_league = TEAM_DOMESTIC_LEAGUE.get(c.home_team, "")
+            away_league = TEAM_DOMESTIC_LEAGUE.get(c.away_team, "")
+            missing = []
+            if home_league and home_league not in _COVERED_LEAGUES:
+                missing.append(f"{c.home_team} ({home_league})")
+            if away_league and away_league not in _COVERED_LEAGUES:
+                missing.append(f"{c.away_team} ({away_league})")
+            if missing:
+                st.warning(f"⚠️ No form data for {', '.join(missing)} — prediction based on league average only.")
             st.markdown(
                 f"**{c.home_team}**{home_ped} vs **{c.away_team}**{away_ped} `{comp_label}`{fl_note}  \n"
                 f"{format_selection(c.market)} &nbsp;·&nbsp; "
@@ -425,3 +461,82 @@ with tab_goals:
         "🟡 2.2–2.6 &nbsp;·&nbsp; "
         "⚪ < 2.2"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 3 — Model Breakdown (debug)
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_debug:
+    st.subheader("🔍 How the model builds each prediction")
+    st.caption(
+        "Expected goals (xG) at each stage of the calculation. "
+        "Higher xG = more goals expected. The team with higher final xG is favoured to win."
+    )
+
+    if not debug_rows:
+        st.info("No fixtures loaded.")
+    else:
+        for d in debug_rows:
+            match = d["match"]
+            home_ped = d["home_ped"]
+            away_ped = d["away_ped"]
+            header = f"**{match.home_team}** vs **{match.away_team}** `{d['comp']}`"
+            with st.expander(header):
+
+                # No-data warnings
+                home_no_data = d["home_league"] not in _COVERED_LEAGUES
+                away_no_data = d["away_league"] not in _COVERED_LEAGUES
+                if home_no_data or away_no_data:
+                    missing = []
+                    if home_no_data:
+                        missing.append(f"{match.home_team} ({d['home_league']})")
+                    if away_no_data:
+                        missing.append(f"{match.away_team} ({d['away_league']})")
+                    st.warning(
+                        f"⚠️ No real form data for: {', '.join(missing)}. "
+                        f"The model is using league average — treat this prediction with caution."
+                    )
+
+                # Step 1: Form (base)
+                st.markdown("**Step 1 — Recent domestic form**")
+                c1, c2 = st.columns(2)
+                c1.metric(f"{match.home_team} xG", f"{d['base_lam_home']:.2f}")
+                c2.metric(f"{match.away_team} xG", f"{d['base_lam_away']:.2f}")
+
+                # Step 2: League strength
+                st.markdown(
+                    f"**Step 2 — League strength** "
+                    f"({d['home_league']} {d['home_str']:.2f} vs {d['away_league']} {d['away_str']:.2f})"
+                )
+                h_delta = d['league_lam_home'] - d['base_lam_home']
+                a_delta = d['league_lam_away'] - d['base_lam_away']
+                c1, c2 = st.columns(2)
+                c1.metric(f"{match.home_team} xG", f"{d['league_lam_home']:.2f}",
+                          delta=f"{h_delta:+.2f}", delta_color="normal")
+                c2.metric(f"{match.away_team} xG", f"{d['league_lam_away']:.2f}",
+                          delta=f"{a_delta:+.2f}", delta_color="normal")
+
+                # Step 3: Pedigree
+                home_ped_str = f"+{home_ped.attack_bonus:.0%} atk / -{home_ped.defence_bonus:.0%} opp" if home_ped else "no bonus"
+                away_ped_str = f"+{away_ped.attack_bonus:.0%} atk / -{away_ped.defence_bonus:.0%} opp" if away_ped else "no bonus"
+                st.markdown(
+                    f"**Step 3 — Pedigree**  \n"
+                    f"{match.home_team}: {home_ped_str}  \n"
+                    f"{match.away_team}: {away_ped_str}"
+                )
+                h_delta2 = d['final_lam_home'] - d['league_lam_home']
+                a_delta2 = d['final_lam_away'] - d['league_lam_away']
+                c1, c2 = st.columns(2)
+                c1.metric(f"{match.home_team} final xG", f"{d['final_lam_home']:.2f}",
+                          delta=f"{h_delta2:+.2f}", delta_color="normal")
+                c2.metric(f"{match.away_team} final xG", f"{d['final_lam_away']:.2f}",
+                          delta=f"{a_delta2:+.2f}", delta_color="normal")
+
+                # Verdict
+                if d['final_lam_home'] > d['final_lam_away'] * 1.1:
+                    verdict = f"➡️ Model favours **{match.home_team}** (home)"
+                elif d['final_lam_away'] > d['final_lam_home'] * 1.1:
+                    verdict = f"➡️ Model favours **{match.away_team}** (away)"
+                else:
+                    verdict = "➡️ Model sees this as roughly even"
+                st.info(verdict)

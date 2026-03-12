@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dotenv import load_dotenv; load_dotenv()
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -81,6 +82,22 @@ EUROPEAN_COMPETITIONS = {
 _NAME_OVERRIDES: Dict[str, str] = {
     # football-data.org names -> canonical
     "Arsenal FC":                "Arsenal",
+    # API-Football (RapidAPI) names -> canonical
+    "Bayern München":            "Bayern Munich",
+    "Internazionale":            "Inter Milan",
+    "Paris Saint-Germain":       "PSG",
+    "Olympique de Marseille":    "Olympique de Marseille",
+    "Olympique Lyonnais":        "Olympique Lyonnais",
+    "AS Monaco":                 "Monaco",
+    "LOSC Lille":                "Lille",
+    "Stade Rennais":             "Rennes",
+    "Eintracht Frankfurt":       "Eintracht Frankfurt",
+    "VfB Stuttgart":             "Stuttgart",
+    "TSG Hoffenheim":            "Hoffenheim",
+    "Sport-Club Freiburg":       "Freiburg",
+    "1. FSV Mainz 05":           "Mainz",
+    "1. FC Köln":                "Koln",
+    "Bayer Leverkusen":          "Bayer Leverkusen",
     "Brighton & Hove Albion FC": "Brighton",
     "Manchester City FC":        "Manchester City",
     "Manchester United FC":      "Manchester United",
@@ -275,6 +292,111 @@ class OddsApiClient:
         data = resp.json()
         _cache_save(cache_key, {"odds": data})
         return data
+
+
+# ---------------------------------------------------------------------------
+# API-Football client (api-sports.io direct)
+# Covers Bundesliga, Serie A, Ligue 1 — leagues not on football-data.org free tier.
+# Free tier: 100 requests/day. Each league fetch = 1 request.
+# Sign up: https://www.api-sports.io/
+# ---------------------------------------------------------------------------
+
+# API-Football league IDs -> our internal league IDs
+AF_LEAGUE_MAP: Dict[int, str] = {
+    78:  "BUNDESLIGA",
+    135: "SERIEA",
+    61:  "LIGUE1",
+}
+
+
+class ApiFootballClient:
+    """
+    Wraps the API-Football v3 REST API (api-sports.io direct endpoint).
+
+    Free tier: 100 requests/day.
+    Docs: https://www.api-football.com/documentation-v3
+    """
+
+    BASE_URL = "https://v3.football.api-sports.io"
+
+    def __init__(self, api_key: str):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "x-apisports-key": api_key,
+        })
+
+    def _get(self, path: str, params: Optional[dict] = None) -> dict:
+        url = f"{self.BASE_URL}{path}"
+        resp = self.session.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_finished_matches(self, league_id: int, season: int) -> List[dict]:
+        """
+        All finished matches for a league in a given season.
+        league_id: API-Football league ID (e.g. 78 = Bundesliga)
+        season: start year of the season (e.g. 2025 = 2025/26)
+        """
+        cache_key = f"af_{league_id}_{season}_finished"
+        cached = _cache_load(cache_key, max_age_seconds=3600)
+        if cached:
+            return cached["matches"]
+
+        data = self._get(
+            "/fixtures",
+            params={"league": league_id, "season": season, "status": "FT"},
+        )
+        matches = data.get("response", [])
+        _cache_save(cache_key, {"matches": matches})
+        return matches
+
+    def parse_result(self, raw: dict) -> Optional[dict]:
+        """Convert an API-Football fixture dict into our internal format."""
+        try:
+            hg = raw["goals"]["home"]
+            ag = raw["goals"]["away"]
+            if hg is None or ag is None:
+                return None
+            return {
+                "date":       datetime.fromisoformat(
+                                  raw["fixture"]["date"].replace("Z", "+00:00")
+                              ),
+                "home":       normalise_team_name(raw["teams"]["home"]["name"]),
+                "away":       normalise_team_name(raw["teams"]["away"]["name"]),
+                "home_goals": int(hg),
+                "away_goals": int(ag),
+                "competition": "",
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+def fetch_api_football_results(
+    af_client: ApiFootballClient,
+    season: int,
+) -> List[dict]:
+    """
+    Fetch finished domestic results for Bundesliga, Serie A, and Ligue 1
+    from API-Football and return them in the same parsed format used by
+    FormCalculator — ready to pass as extra_results to fetch_euro_competition().
+
+    The free plan only covers up to season 2024. If the requested season
+    returns no data, we automatically fall back to the previous season.
+    """
+    all_results: List[dict] = []
+    for league_id in AF_LEAGUE_MAP:
+        try:
+            raw_matches = af_client.get_finished_matches(league_id, season)
+            # Free plan may not cover the current season — fall back one year
+            if not raw_matches:
+                raw_matches = af_client.get_finished_matches(league_id, season - 1)
+            for raw in raw_matches:
+                parsed = af_client.parse_result(raw)
+                if parsed:
+                    all_results.append(parsed)
+        except Exception:
+            pass  # If one league fails, keep going with the others
+    return all_results
 
 
 # ---------------------------------------------------------------------------

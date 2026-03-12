@@ -52,7 +52,7 @@ class PedigreeEntry:
 ELITE_CLUBS: Dict[str, PedigreeEntry] = {
     # ── Attacking elite ──────────────────────────────────────────────
     "Real Madrid":               PedigreeEntry(attack_bonus=0.16, defence_bonus=0.10),
-    "Barcelona":                 PedigreeEntry(attack_bonus=0.13, defence_bonus=0.08),
+    "Barcelona":                 PedigreeEntry(attack_bonus=0.13, defence_bonus=0.05),
     "Bayern Munich":             PedigreeEntry(attack_bonus=0.13, defence_bonus=0.08),
     "Paris Saint-Germain":       PedigreeEntry(attack_bonus=0.12, defence_bonus=0.08),
     "PSG":                       PedigreeEntry(attack_bonus=0.12, defence_bonus=0.08),
@@ -64,16 +64,16 @@ ELITE_CLUBS: Dict[str, PedigreeEntry] = {
     "Inter Milan":               PedigreeEntry(attack_bonus=0.07, defence_bonus=0.07),
     "Internazionale":            PedigreeEntry(attack_bonus=0.07, defence_bonus=0.07),
     "Chelsea":                   PedigreeEntry(attack_bonus=0.06, defence_bonus=0.06),
-    "Arsenal":                   PedigreeEntry(attack_bonus=0.05, defence_bonus=0.05),
+    "Arsenal":                   PedigreeEntry(attack_bonus=0.05, defence_bonus=0.09),
     "Juventus":                  PedigreeEntry(attack_bonus=0.05, defence_bonus=0.07),
     "Benfica":                   PedigreeEntry(attack_bonus=0.04, defence_bonus=0.04),
     "Porto":                     PedigreeEntry(attack_bonus=0.04, defence_bonus=0.04),
-    "Bayer Leverkusen":          PedigreeEntry(attack_bonus=0.06, defence_bonus=0.05),
+    "Bayer Leverkusen":          PedigreeEntry(attack_bonus=0.05, defence_bonus=0.05),
     "RB Leipzig":                PedigreeEntry(attack_bonus=0.05, defence_bonus=0.04),
 
     # ── Defensive elite (bonus weighted heavily to defence) ──────────
-    "Atletico Madrid":           PedigreeEntry(attack_bonus=0.02, defence_bonus=0.05),
-    "Atletico de Madrid":        PedigreeEntry(attack_bonus=0.02, defence_bonus=0.05),
+    "Atletico Madrid":           PedigreeEntry(attack_bonus=0.05, defence_bonus=0.07),
+    "Atletico de Madrid":        PedigreeEntry(attack_bonus=0.05, defence_bonus=0.07),
 }
 
 
@@ -137,6 +137,52 @@ class EuroMatchModel(MatchModel):
         super().__init__(league_configs)
         self.team_league_map  = team_league_map
         self.first_leg_scores = first_leg_scores or {}
+
+    def debug_lambdas(self, match) -> dict:
+        """Return a breakdown of how lambdas are built, step by step."""
+        home_league = self.team_league_map.get(match.home_team, match.league)
+        away_league = self.team_league_map.get(match.away_team, match.league)
+        first_leg   = self.first_leg_scores.get(f"{match.home_team} vs {match.away_team}")
+
+        base = super().lambdas(match)
+        lh, la = base.lam_home, base.lam_away
+
+        # League strength
+        home_str = LEAGUE_STRENGTH.get(home_league, EURO_BASELINE)
+        away_str = LEAGUE_STRENGTH.get(away_league, EURO_BASELINE)
+        if home_league != away_league:
+            ratio = home_str / away_str
+            lh_league = lh * ratio ** 0.25
+            la_league = la * (1 / ratio) ** 0.25
+        else:
+            lh_league, la_league = lh, la
+
+        # Pedigree
+        home_ped = ELITE_CLUBS.get(match.home_team)
+        away_ped = ELITE_CLUBS.get(match.away_team)
+        lh_ped, la_ped = lh_league, la_league
+        if home_ped:
+            lh_ped *= (1.0 + home_ped.attack_bonus)
+            la_ped *= (1.0 - home_ped.defence_bonus)
+        if away_ped:
+            la_ped *= (1.0 + away_ped.attack_bonus)
+            lh_ped *= (1.0 - away_ped.defence_bonus)
+
+        return {
+            "home_league":    home_league,
+            "away_league":    away_league,
+            "home_str":       home_str,
+            "away_str":       away_str,
+            "base_lam_home":  base.lam_home,
+            "base_lam_away":  base.lam_away,
+            "league_lam_home": lh_league,
+            "league_lam_away": la_league,
+            "final_lam_home": clamp(lh_ped, 0.2, 3.5),
+            "final_lam_away": clamp(la_ped, 0.2, 3.5),
+            "home_ped":       home_ped,
+            "away_ped":       away_ped,
+            "first_leg":      first_leg,
+        }
 
     def lambdas(self, match) -> LambdaResult:
         """Override: apply European adjustments on top of base domestic lambdas."""

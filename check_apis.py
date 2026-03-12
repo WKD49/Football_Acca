@@ -6,6 +6,7 @@ with your free keys. Run this once to confirm what works.
 """
 
 import os
+from dotenv import load_dotenv; load_dotenv()
 import requests
 
 fd_key   = os.environ.get("FOOTBALL_DATA_KEY", "")
