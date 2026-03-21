@@ -453,9 +453,21 @@ class FormCalculator:
     A multiplier of 1.15 means 15% above average; 0.90 means 10% below.
     """
 
-    def __init__(self, long_window: int = 25, short_window: int = 6):
-        self.long_window = long_window
-        self.short_window = short_window
+    def __init__(self, long_half_life: float = 10.0, short_half_life: float = 3.0):
+        """
+        Exponentially weighted form decay.
+
+        long_half_life  — matches ago at which a result has half the weight of
+                          the most recent game (feeds _long fields, ~season-wide view)
+        short_half_life — same but for the fast-decay component (~recent 3–5 games)
+
+        Replaces the old hard 25/6-match windows. Benefits:
+          · no cliff-edge at the window boundary
+          · manager changes and form collapses automatically reflected
+          · the short component gives more weight to the last 1–2 games
+        """
+        self.long_half_life  = long_half_life
+        self.short_half_life = short_half_life
 
     def parse_result(self, raw: dict) -> Optional[dict]:
         """
@@ -512,29 +524,39 @@ class FormCalculator:
             key=lambda r: r["date"], reverse=True,
         )
 
-        def avg(matches: List[dict], scored: bool, window: int) -> float:
-            subset = matches[:window]
-            if not subset:
-                return 1.0
-            goals = [
-                (m["home_goals"] if m["home"] == team else m["away_goals"]) if scored
-                else (m["away_goals"] if m["home"] == team else m["home_goals"])
-                for m in subset
-            ]
-            return sum(goals) / len(goals)
+        def ewma(matches: List[dict], scored: bool, half_life: float) -> float:
+            """
+            Exponentially weighted average of goals, most-recent-first.
+            weight_i = alpha^i  where  alpha = 0.5^(1/half_life)
+            Returns raw goals per match (normalised to a multiplier by caller).
+            """
+            if not matches:
+                return 1.0  # will become 1.0/league_avg ≈ 1.0 below
+            alpha = 0.5 ** (1.0 / half_life)
+            total_w = 0.0
+            total_g = 0.0
+            for i, m in enumerate(matches):
+                w = alpha ** i
+                if m["home"] == team:
+                    g = m["home_goals"] if scored else m["away_goals"]
+                else:
+                    g = m["away_goals"] if scored else m["home_goals"]
+                total_g += w * g
+                total_w += w
+            return total_g / total_w if total_w > 0 else 1.0
 
         def ratio(team_avg: float, league_avg: float) -> float:
             return team_avg / league_avg if league_avg > 0 else 1.0
 
         return TeamFeatures(
-            home_attack_long=  ratio(avg(home_matches, scored=True,  window=self.long_window),  league_home_avg),
-            home_attack_short= ratio(avg(home_matches, scored=True,  window=self.short_window), league_home_avg),
-            home_defence_long= ratio(avg(home_matches, scored=False, window=self.long_window),  league_away_avg),
-            home_defence_short=ratio(avg(home_matches, scored=False, window=self.short_window), league_away_avg),
-            away_attack_long=  ratio(avg(away_matches, scored=True,  window=self.long_window),  league_away_avg),
-            away_attack_short= ratio(avg(away_matches, scored=True,  window=self.short_window), league_away_avg),
-            away_defence_long= ratio(avg(away_matches, scored=False, window=self.long_window),  league_home_avg),
-            away_defence_short=ratio(avg(away_matches, scored=False, window=self.short_window), league_home_avg),
+            home_attack_long=  ratio(ewma(home_matches, scored=True,  half_life=self.long_half_life),  league_home_avg),
+            home_attack_short= ratio(ewma(home_matches, scored=True,  half_life=self.short_half_life), league_home_avg),
+            home_defence_long= ratio(ewma(home_matches, scored=False, half_life=self.long_half_life),  league_away_avg),
+            home_defence_short=ratio(ewma(home_matches, scored=False, half_life=self.short_half_life), league_away_avg),
+            away_attack_long=  ratio(ewma(away_matches, scored=True,  half_life=self.long_half_life),  league_away_avg),
+            away_attack_short= ratio(ewma(away_matches, scored=True,  half_life=self.short_half_life), league_away_avg),
+            away_defence_long= ratio(ewma(away_matches, scored=False, half_life=self.long_half_life),  league_home_avg),
+            away_defence_short=ratio(ewma(away_matches, scored=False, half_life=self.short_half_life), league_home_avg),
             strict_validation=strict_validation,
         )
 
@@ -801,7 +823,7 @@ _EURO_FD_CODES: Dict[str, str] = {
 
 # 25/6 window — same as domestic, but the pool includes both domestic
 # league results and CL/EL league-phase results combined.
-_EURO_CALC = FormCalculator(long_window=25, short_window=6)
+_EURO_CALC = FormCalculator()  # uses default half-lives (10 long, 3 short)
 
 _NEUTRAL_FEATURES = TeamFeatures(
     home_attack_long=1.0,  home_attack_short=1.0,
