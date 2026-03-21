@@ -126,6 +126,13 @@ _NAME_OVERRIDES: Dict[str, str] = {
     "AVS Futebol SAD":           "AVS",
     "AVS Futebol":               "AVS",
     "Sporting Lisbon":           "Sporting CP",
+    # Understat.com names -> canonical
+    "Paris Saint Germain":       "PSG",
+    "Inter":                     "Inter Milan",
+    "Hellas Verona":             "Verona",
+    "Wolverhampton Wanderers":   "Wolves",
+    "Nottingham Forest":         "Nottm Forest",
+    "Leicester":                 "Leicester City",
 }
 
 _STRIP_SUFFIXES  = (" FC", " AFC", " CF", " SC", " FK", " IF", " BK", " SK", " KV",
@@ -440,6 +447,117 @@ def fetch_api_football_results(
 
 
 # ---------------------------------------------------------------------------
+# Understat xG client
+# Scrapes expected-goals data from understat.com (free, no API key).
+# Supports EPL, La Liga, Bundesliga, Serie A, Ligue 1.
+# Cache TTL: 6 hours (data only changes when matches finish).
+# ---------------------------------------------------------------------------
+
+class UnderstatClient:
+    """
+    Fetches xG (expected goals) data by scraping understat.com.
+
+    Plain English: xG is a measure of how many goals a team *should* have
+    scored based on the quality of their chances. Blending xG with actual
+    goals gives the model a more stable picture of a team's true strength —
+    a team that scores 3 goals from 1 xG got lucky; a team with 3 xG that
+    scored 1 was unlucky. The blend is 65% xG + 35% actual goals.
+
+    Understat covers EPL, La Liga, Bundesliga, Serie A, and Ligue 1.
+    Championship and Primeira Liga fall back to goals only.
+    """
+
+    LEAGUE_MAP: Dict[str, str] = {
+        "EPL":       "EPL",
+        "LALIGA":    "La_liga",
+        "BUNDESLIGA":"Bundesliga",
+        "SERIEA":    "Serie_A",
+        "LIGUE1":    "Ligue_1",
+    }
+
+    _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+    def get_matches(self, league_id: str, season: int) -> List[dict]:
+        """
+        Return finished matches with xG for the given league/season.
+        Each dict: {home, away, home_goals, away_goals, home_xg, away_xg}.
+        Returns [] if the league is not supported or the request fails.
+        """
+        understat_key = self.LEAGUE_MAP.get(league_id)
+        if not understat_key:
+            return []
+
+        cache_key = f"understat_{league_id}_{season}"
+        cached = _cache_load(cache_key, max_age_seconds=21600)  # 6 hours
+        if cached:
+            return cached["matches"]
+
+        # Understat requires a session cookie obtained by visiting the league page
+        # before it will serve the JSON data endpoint.
+        try:
+            session = requests.Session()
+            session.headers["User-Agent"] = self._UA
+            session.get(f"https://understat.com/league/{understat_key}/{season}", timeout=15)
+            r = session.get(
+                f"https://understat.com/getLeagueData/{understat_key}/{season}",
+                timeout=20,
+                headers={
+                    "Referer": f"https://understat.com/league/{understat_key}/{season}",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            r.raise_for_status()
+            raw = json.loads(r.text)
+            entries = raw.get("dates", [])
+        except Exception:
+            return []
+
+        matches: List[dict] = []
+        for entry in entries:
+            if not entry.get("isResult"):
+                continue
+            try:
+                home_name = normalise_team_name(entry["h"]["title"])
+                away_name = normalise_team_name(entry["a"]["title"])
+                matches.append({
+                    "home":       home_name,
+                    "away":       away_name,
+                    "home_goals": int(entry["goals"]["h"]),
+                    "away_goals": int(entry["goals"]["a"]),
+                    "home_xg":    float(entry["xG"]["h"]),
+                    "away_xg":    float(entry["xG"]["a"]),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        _cache_save(cache_key, {"matches": matches})
+        return matches
+
+
+def _blend_xg(parsed: List[dict], xg_matches: List[dict]) -> List[dict]:
+    """
+    Replace home_goals/away_goals with 0.65*xG + 0.35*actual for any
+    match that has xG data. Unmatched matches are left unchanged.
+    """
+    if not xg_matches:
+        return parsed
+    xg_lookup = {(m["home"], m["away"]): (m["home_xg"], m["away_xg"]) for m in xg_matches}
+    enriched = []
+    for p in parsed:
+        key = (p["home"], p["away"])
+        if key in xg_lookup:
+            hxg, axg = xg_lookup[key]
+            enriched.append({
+                **p,
+                "home_goals": round(0.65 * hxg + 0.35 * p["home_goals"], 3),
+                "away_goals": round(0.65 * axg + 0.35 * p["away_goals"], 3),
+            })
+        else:
+            enriched.append(p)
+    return enriched
+
+
+# ---------------------------------------------------------------------------
 # Form calculator: raw match results -> TeamFeatures multipliers
 # ---------------------------------------------------------------------------
 
@@ -739,6 +857,11 @@ def fetch_competition(
     raw_finished = fd_client.get_finished_matches(competition_code, season)
     parsed = [calc.parse_result(m) for m in raw_finished]
     parsed = [p for p in parsed if p is not None]
+
+    # Enrich with xG where Understat has coverage (EPL, La Liga, Bundesliga, Serie A, Ligue 1)
+    xg_data = UnderstatClient().get_matches(league_id, season)
+    parsed = _blend_xg(parsed, xg_data)
+
     league_home_avg, league_away_avg = calc.league_averages(parsed)
 
     # Also fetch previous season for H2H (cached separately, no extra cost per run)
