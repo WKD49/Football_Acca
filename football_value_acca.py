@@ -588,45 +588,59 @@ class MatchModel:
 
 class MarketPricer:
     """
-    - 1X2 from Poisson scoreline (truncated)
-    - Over/Under from Poisson total goals
+    - 1X2 and Over/Under from DC-corrected Poisson scoreline matrix.
+    - Dixon-Coles (1997) correction adjusts joint probabilities for
+      low-scoring outcomes (0-0, 1-0, 0-1, 1-1) to fix the basic Poisson
+      model's known underestimation of draws.
+    - rho ≈ -0.10 is the standard estimate from English football data.
     """
 
-    def __init__(self, max_goals: int = 10):
+    def __init__(self, max_goals: int = 10, rho: float = -0.10):
         self.max_goals = max_goals
+        self.rho = rho
+
+    def _dc_tau(self, hg: int, ag: int, lam_home: float, lam_away: float) -> float:
+        """Dixon-Coles correction factor — only non-trivial for hg+ag <= 1."""
+        rho = self.rho
+        if   hg == 0 and ag == 0: return 1.0 - lam_home * lam_away * rho
+        elif hg == 0 and ag == 1: return 1.0 + lam_home * rho
+        elif hg == 1 and ag == 0: return 1.0 + lam_away * rho
+        elif hg == 1 and ag == 1: return 1.0 - rho
+        return 1.0
+
+    def _score_probs(self, lam_home: float, lam_away: float) -> Dict[Tuple[int, int], float]:
+        """
+        DC-corrected joint scoreline probability matrix.
+        Normalised so all entries sum to 1.
+        """
+        probs: Dict[Tuple[int, int], float] = {}
+        for hg in range(self.max_goals + 1):
+            ph = poisson_pmf(hg, lam_home)
+            for ag in range(self.max_goals + 1):
+                pa = poisson_pmf(ag, lam_away)
+                probs[(hg, ag)] = ph * pa * self._dc_tau(hg, ag, lam_home, lam_away)
+        total = sum(probs.values())
+        if total > 0:
+            probs = {k: v / total for k, v in probs.items()}
+        return probs
 
     def p_1x2(self, lam_home: float, lam_away: float) -> Tuple[float, float, float]:
-        p_home = 0.0
-        p_draw = 0.0
-        p_away = 0.0
-
-        for hg in range(0, self.max_goals + 1):
-            ph = poisson_pmf(hg, lam_home)
-            for ag in range(0, self.max_goals + 1):
-                pa = poisson_pmf(ag, lam_away)
-                p = ph * pa
-                if hg > ag:
-                    p_home += p
-                elif hg == ag:
-                    p_draw += p
-                else:
-                    p_away += p
-
-        s = p_home + p_draw + p_away
-        if s > 0:
-            p_home, p_draw, p_away = p_home / s, p_draw / s, p_away / s
+        probs = self._score_probs(lam_home, lam_away)
+        p_home = sum(p for (hg, ag), p in probs.items() if hg > ag)
+        p_draw = sum(p for (hg, ag), p in probs.items() if hg == ag)
+        p_away = sum(p for (hg, ag), p in probs.items() if ag > hg)
         return p_home, p_draw, p_away
 
     def p_over_under(self, lam_home: float, lam_away: float, line: float) -> Tuple[float, float]:
         """
-        For line=2.5:
-          OVER => total goals >= 3
-          UNDER => total goals <= 2
+        For line=2.5: OVER => total >= 3, UNDER => total <= 2.
+        Uses the DC-corrected scoreline matrix (not the simple Poisson CDF),
+        so the correction flows through to the goals market.
         """
-        lam_total = lam_home + lam_away
-        under_max = int(line // 1)  # 2.5 -> 2
-        p_under = poisson_cdf(under_max, lam_total)
-        p_over = 1.0 - p_under
+        probs = self._score_probs(lam_home, lam_away)
+        under_max = int(line)   # 2.5 -> 2
+        p_under = sum(p for (hg, ag), p in probs.items() if hg + ag <= under_max)
+        p_over  = 1.0 - p_under
         return p_over, p_under
 
 
