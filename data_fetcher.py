@@ -350,6 +350,46 @@ class ApiFootballClient:
         _cache_save(cache_key, {"matches": matches})
         return matches
 
+    def get_recently_finished(self, league_id: int, season: int, days_back: int = 35) -> List[dict]:
+        """Finished matches in the last N days — much smaller than the full season dump."""
+        now = datetime.now(timezone.utc)
+        date_from = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        date_to   = now.strftime("%Y-%m-%d")
+
+        cache_key = f"af_{league_id}_{season}_recent_{date_from}"
+        cached = _cache_load(cache_key, max_age_seconds=3600)
+        if cached:
+            return cached["matches"]
+
+        data = self._get(
+            "/fixtures",
+            params={"league": league_id, "season": season,
+                    "from": date_from, "to": date_to, "status": "FT"},
+        )
+        matches = data.get("response", [])
+        _cache_save(cache_key, {"matches": matches})
+        return matches
+
+    def get_upcoming_fixtures(self, league_id: int, season: int, days_ahead: int = 21) -> List[dict]:
+        """Upcoming (not-started) fixtures for a league, within the next N days."""
+        now = datetime.now(timezone.utc)
+        date_from = now.strftime("%Y-%m-%d")
+        date_to   = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+        cache_key = f"af_{league_id}_{season}_upcoming_{date_from}"
+        cached = _cache_load(cache_key, max_age_seconds=1800)
+        if cached:
+            return cached["fixtures"]
+
+        data = self._get(
+            "/fixtures",
+            params={"league": league_id, "season": season,
+                    "from": date_from, "to": date_to, "status": "NS"},
+        )
+        fixtures = data.get("response", [])
+        _cache_save(cache_key, {"fixtures": fixtures})
+        return fixtures
+
     def parse_result(self, raw: dict) -> Optional[dict]:
         """Convert an API-Football fixture dict into our internal format."""
         try:
@@ -743,6 +783,8 @@ def fetch_euro_competition(
     fd_client: Optional[FootballDataClient] = None,
     extra_results: Optional[List[dict]] = None,
     bookmaker_filter: Optional[str] = None,
+    af_client: Optional[ApiFootballClient] = None,
+    af_league_id: Optional[int] = None,
 ) -> List[Tuple[Match, List[Tuple[Market, OddsSnapshot]]]]:
     """
     Fetch European knockout fixtures and odds.
@@ -778,59 +820,174 @@ def fetch_euro_competition(
     league_home_avg, league_away_avg = _EURO_CALC.league_averages(parsed)
     has_form = bool(parsed)
 
-    # ── Fixtures + odds from The Odds API ──────────────────────────────────
+    # ── Odds lookup from The Odds API (keyed by normalised team names) ─────
     odds_events = odds_client.get_odds(odds_sport_key)
+    odds_lookup: Dict[Tuple[str, str], dict] = {}
+    for ev in odds_events:
+        h = normalise_team_name(ev.get("home_team", ""))
+        a = normalise_team_name(ev.get("away_team", ""))
+        odds_lookup[(h, a)] = ev
+
     output: List[Tuple[Match, List[Tuple[Market, OddsSnapshot]]]] = []
 
-    for ev in odds_events:
-        home = normalise_team_name(ev.get("home_team", ""))
-        away = normalise_team_name(ev.get("away_team", ""))
-
+    # ── Fixture source: API-Football (complete CL/EL coverage) if available,
+    #    otherwise fall back to The Odds API events ─────────────────────────
+    af_upcoming: List[dict] = []
+    if af_client and af_league_id:
         try:
-            kickoff = datetime.fromisoformat(
-                ev.get("commence_time", "").replace("Z", "+00:00")
-            )
-        except (ValueError, AttributeError):
-            continue
+            af_upcoming = af_client.get_upcoming_fixtures(af_league_id, season)
+        except Exception:
+            af_upcoming = []
 
+    def _build_match_and_odds(home: str, away: str, kickoff: datetime, match_id: str):
         if has_form:
-            home_features = _EURO_CALC.compute(home, parsed, league_home_avg, league_away_avg)
-            away_features = _EURO_CALC.compute(away, parsed, league_home_avg, league_away_avg)
-            data_quality = 0.72
+            hf = _EURO_CALC.compute(home, parsed, league_home_avg, league_away_avg)
+            af_ = _EURO_CALC.compute(away, parsed, league_home_avg, league_away_avg)
+            dq = 0.72
         else:
-            home_features = _NEUTRAL_FEATURES
-            away_features = _NEUTRAL_FEATURES
-            data_quality = 0.60
+            hf = _NEUTRAL_FEATURES
+            af_ = _NEUTRAL_FEATURES
+            dq = 0.60
 
-        match = Match(
-            match_id=ev.get("id", f"{league_id}_{home}_{away}"),
+        m = Match(
+            match_id=match_id,
             league=league_id,
             kickoff_utc=kickoff,
             home_team=home,
             away_team=away,
-            home_features=home_features,
-            away_features=away_features,
+            home_features=hf,
+            away_features=af_,
             home_schedule=_EURO_SCHED,
             away_schedule=_EURO_SCHED,
-            league_data_quality=data_quality,
+            league_data_quality=dq,
         )
 
-        market_odds: List[Tuple[Market, OddsSnapshot]] = []
-        for sel in ("HOME", "DRAW", "AWAY"):
-            snap = best_odds_for_selection(ev, "1X2", sel, bookmaker_filter=bookmaker_filter)
-            if snap:
-                market_odds.append((Market(kind="1X2", selection=sel), snap))
-        for sel in ("OVER", "UNDER"):
-            snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=bookmaker_filter)
-            # Fall back to best available if chosen bookmaker doesn't offer totals
-            if snap is None and bookmaker_filter:
-                snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=None)
-            if snap:
-                market_odds.append((Market(kind="OVER_UNDER", line=2.5, selection=sel), snap))
+        ev = odds_lookup.get((home, away))
+        mo: List[Tuple[Market, OddsSnapshot]] = []
+        if ev:
+            for sel in ("HOME", "DRAW", "AWAY"):
+                snap = best_odds_for_selection(ev, "1X2", sel, bookmaker_filter=bookmaker_filter)
+                if snap:
+                    mo.append((Market(kind="1X2", selection=sel), snap))
+            for sel in ("OVER", "UNDER"):
+                snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=bookmaker_filter)
+                if snap is None and bookmaker_filter:
+                    snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=None)
+                if snap:
+                    mo.append((Market(kind="OVER_UNDER", line=2.5, selection=sel), snap))
+        return m, mo
 
-        output.append((match, market_odds))
+    if af_upcoming:
+        seen: set = set()
+        for raw in af_upcoming:
+            try:
+                home = normalise_team_name(raw["teams"]["home"]["name"])
+                away = normalise_team_name(raw["teams"]["away"]["name"])
+                kickoff = datetime.fromisoformat(
+                    raw["fixture"]["date"].replace("Z", "+00:00")
+                )
+                match_id = str(raw["fixture"]["id"])
+            except (KeyError, ValueError):
+                continue
+            key = (home, away)
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(_build_match_and_odds(home, away, kickoff, match_id))
+    else:
+        # Fallback: use The Odds API events as fixture source
+        for ev in odds_events:
+            home = normalise_team_name(ev.get("home_team", ""))
+            away = normalise_team_name(ev.get("away_team", ""))
+            try:
+                kickoff = datetime.fromisoformat(
+                    ev.get("commence_time", "").replace("Z", "+00:00")
+                )
+            except (ValueError, AttributeError):
+                continue
+            output.append(_build_match_and_odds(home, away, kickoff,
+                                                ev.get("id", f"{league_id}_{home}_{away}")))
 
     return output
+
+
+# ---------------------------------------------------------------------------
+# Auto-detect first leg scores for European knockout second legs
+# ---------------------------------------------------------------------------
+
+# API-Football league IDs for European competitions
+_AF_EURO_LEAGUE_IDS = {
+    2: "UCL",  # UEFA Champions League
+    3: "UEL",  # UEFA Europa League
+}
+
+
+def fetch_euro_first_leg_scores(
+    upcoming_fixtures: list,
+    fd_client: "FootballDataClient",
+    season: int,
+    af_client: Optional["ApiFootballClient"] = None,
+    days_lookback: int = 35,
+) -> Dict[str, Tuple[int, int]]:
+    """
+    Auto-detect first leg scores for upcoming 2nd-leg CL/EL fixtures.
+
+    Uses API-Football as primary source (full knockout round coverage), with
+    football-data.org as fallback. Looks at recently finished CL/EL matches
+    (within the last `days_lookback` days) and checks whether the teams in any
+    upcoming fixture played each other with home/away reversed.
+
+    Score is expressed from the perspective of the 2nd-leg home team:
+      (goals the 2nd-leg home team scored in leg 1,
+       goals the 2nd-leg away team scored in leg 1)
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_lookback)
+    finished: List[dict] = []
+
+    # Primary: API-Football — fetch only the last 35 days to avoid season-dump truncation
+    if af_client:
+        for league_id in _AF_EURO_LEAGUE_IDS:
+            try:
+                raw_matches = af_client.get_recently_finished(league_id, season, days_back=days_lookback)
+                if not raw_matches:
+                    raw_matches = af_client.get_recently_finished(league_id, season - 1, days_back=days_lookback)
+                for raw in raw_matches:
+                    parsed = af_client.parse_result(raw)
+                    if parsed and parsed["date"] >= cutoff:
+                        finished.append(parsed)
+            except Exception:
+                pass
+
+    # Fallback: football-data.org (free tier has patchy knockout coverage)
+    if not finished:
+        calc = FormCalculator()
+        for fd_code in ("CL", "EL"):
+            try:
+                raw = fd_client.get_finished_matches(fd_code, season)
+                for m in raw:
+                    parsed = calc.parse_result(m)
+                    if parsed and parsed["date"] >= cutoff:
+                        finished.append(parsed)
+            except Exception:
+                pass
+
+    # Build lookup: (home_team, away_team) -> (home_goals, away_goals)
+    results_lookup: Dict[Tuple[str, str], Tuple[int, int]] = {}
+    for r in finished:
+        results_lookup[(r["home"], r["away"])] = (r["home_goals"], r["away_goals"])
+
+    # For each upcoming fixture (A home, B away), look for finished (B home, A away)
+    first_leg_scores: Dict[str, Tuple[int, int]] = {}
+    for match, _ in upcoming_fixtures:
+        home = match.home_team
+        away = match.away_team
+        leg1 = results_lookup.get((away, home))
+        if leg1:
+            # leg1[0] = goals 'away' (current) scored as home in leg 1
+            # leg1[1] = goals 'home' (current) scored as away in leg 1
+            first_leg_scores[f"{home} vs {away}"] = (leg1[1], leg1[0])
+
+    return first_leg_scores
 
 
 # ---------------------------------------------------------------------------

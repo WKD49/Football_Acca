@@ -173,7 +173,7 @@ with st.expander("League breakdown"):
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_value, tab_goals = st.tabs(["📋 Value Bets & Accas", "⚽ High-Scoring Games"])
+tab_value, tab_goals, tab_odds = st.tabs(["📋 Value Bets & Accas", "⚽ High-Scoring Games", "🔢 Odds Translator"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -269,6 +269,21 @@ with tab_value:
             f"(need 5, found {len(yankee_pool)})."
         )
 
+    # Subs bench — next 3 picks after the Super Yankee slots
+    bench = yankee_pool[5:8]
+    if bench:
+        st.markdown("#### 🪑 Subs bench")
+        st.caption("Next best picks by edge × confidence — swap any of the above out for these if you prefer.")
+        for c in bench:
+            st.markdown(
+                f"**{c.home_team} vs {c.away_team}** &nbsp; `{c.league}` &nbsp;·&nbsp; "
+                f"{format_selection(c.market)} "
+                f"@ **{c.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
+                f"Our estimate: {c.model_prob:.0%} &nbsp;·&nbsp; "
+                f"Edge: {c.edge:+.0%} &nbsp;·&nbsp; "
+                f"{conf_badge(c.confidence)}"
+            )
+
     st.divider()
     st.caption(
         "This is a mathematical model. It finds statistical edges but cannot guarantee results. "
@@ -325,4 +340,115 @@ with tab_goals:
         "🟠 2.6–3.0 &nbsp;·&nbsp; "
         "🟡 2.2–2.6 &nbsp;·&nbsp; "
         "⚪ < 2.2"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 3 — Odds Translator
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_odds:
+    st.subheader("🔢 Odds Translator")
+    st.caption(
+        "Convert between fractional (6/1), decimal (7.0), and implied probability (14.3%). "
+        "Use this to compare what the model says against what your bookie is showing."
+    )
+
+    st.markdown("#### Enter any one value — the others will calculate automatically")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        frac_input = st.text_input("Fractional odds (e.g. 6/4 or 10/11)", placeholder="e.g. 6/4")
+    with col2:
+        dec_input = st.text_input("Decimal odds (e.g. 2.50)", placeholder="e.g. 2.50")
+    with col3:
+        prob_input = st.text_input("Implied probability % (e.g. 40)", placeholder="e.g. 40")
+
+    # Parse whichever field was filled in
+    decimal = None
+    source = None
+    error = None
+
+    try:
+        if frac_input.strip():
+            parts = frac_input.strip().split("/")
+            if len(parts) == 2:
+                num, den = float(parts[0]), float(parts[1])
+                decimal = (num / den) + 1
+                source = "fractional"
+            else:
+                error = "Fractional odds should be in the form 6/4"
+        elif dec_input.strip():
+            decimal = float(dec_input.strip())
+            source = "decimal"
+        elif prob_input.strip():
+            prob = float(prob_input.strip().replace("%", ""))
+            if 0 < prob < 100:
+                decimal = 1 / (prob / 100)
+                source = "probability"
+            else:
+                error = "Probability must be between 1 and 99"
+    except ValueError:
+        error = "Couldn't parse that — check your input"
+
+    if error:
+        st.error(error)
+    elif decimal is not None and decimal > 1:
+        implied = 1 / decimal
+        if decimal >= 2:
+            num = decimal - 1
+            # simplify fraction roughly
+            frac_str = f"{num:.2f}/1" if num != round(num) else f"{int(num)}/1"
+        else:
+            # odds-on: express as X/Y where Y > X
+            den = 1 / (decimal - 1)
+            frac_str = f"1/{den:.2f}" if den != round(den) else f"1/{int(den)}"
+
+        st.divider()
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Fractional", frac_str)
+        r2.metric("Decimal", f"{decimal:.2f}")
+        r3.metric("Implied probability", f"{implied:.1%}")
+
+        st.divider()
+        st.markdown("#### What does this mean for the model?")
+        st.markdown(
+            f"The bookie thinks this has a **{implied:.1%}** chance of happening.  \n"
+            f"If the model shows **Our estimate** above {implied:.1%} for the same selection, "
+            f"there's a **value edge** — the model thinks it's more likely than the bookie does.  \n"
+            f"If the model's estimate is *below* {implied:.1%}, the bookie has already priced it tighter than the model — no value."
+        )
+    elif decimal is not None:
+        st.error("Decimal odds must be greater than 1.0")
+
+    st.divider()
+    st.markdown("#### Quick reference table")
+    ref_data = [
+        ("1/4",  "1.25", "80.0%"),
+        ("1/3",  "1.33", "75.0%"),
+        ("4/9",  "1.44", "69.2%"),
+        ("1/2",  "1.50", "66.7%"),
+        ("8/13", "1.62", "61.9%"),
+        ("4/6",  "1.67", "60.0%"),
+        ("8/11", "1.73", "57.9%"),
+        ("4/5",  "1.80", "55.6%"),
+        ("10/11","1.91", "52.4%"),
+        ("Evs",  "2.00", "50.0%"),
+        ("6/5",  "2.20", "45.5%"),
+        ("5/4",  "2.25", "44.4%"),
+        ("6/4",  "2.50", "40.0%"),
+        ("7/4",  "2.75", "36.4%"),
+        ("2/1",  "3.00", "33.3%"),
+        ("9/4",  "3.25", "30.8%"),
+        ("5/2",  "3.50", "28.6%"),
+        ("3/1",  "4.00", "25.0%"),
+        ("4/1",  "5.00", "20.0%"),
+        ("5/1",  "6.00", "16.7%"),
+        ("6/1",  "7.00", "14.3%"),
+        ("10/1", "11.00","9.1%"),
+    ]
+    st.markdown(
+        "| Fractional | Decimal | Implied % |\n"
+        "|---|---|---|\n" +
+        "\n".join(f"| {f} | {d} | {p} |" for f, d, p in ref_data)
     )

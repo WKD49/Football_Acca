@@ -11,10 +11,12 @@ This is a SEPARATE model from the domestic app — it applies:
   • Two-leg aggregate context (enter first leg score to adjust)
 """
 
+import json
 import os
 from dotenv import load_dotenv; load_dotenv()
 from datetime import datetime, timezone
 from itertools import combinations
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import streamlit as st
@@ -22,6 +24,7 @@ import streamlit as st
 from data_fetcher import (
     FootballDataClient, OddsApiClient, fetch_euro_competition,
     ApiFootballClient, fetch_api_football_results,
+    fetch_euro_first_leg_scores,
 )
 from football_value_acca import (
     AccaConstraints, CandidateRules, LEAGUE_CONFIGS,
@@ -42,9 +45,24 @@ from run import (
 
 EURO_DAYS_AHEAD = 14
 
+_SCORES_FILE = Path(".cache/first_leg_scores.json")
+
+
+def _load_saved_scores() -> Dict[str, Tuple[int, int]]:
+    try:
+        data = json.loads(_SCORES_FILE.read_text())
+        return {k: tuple(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def _save_scores(scores: Dict[str, Tuple[int, int]]) -> None:
+    _SCORES_FILE.parent.mkdir(exist_ok=True)
+    _SCORES_FILE.write_text(json.dumps({k: list(v) for k, v in scores.items()}))
+
 EURO_COMPETITIONS = [
-    ("CL", "UCL", "soccer_uefa_champs_league"),
-    ("EL", "UEL", "soccer_uefa_europa_league"),
+    ("CL", "UCL", "soccer_uefa_champs_league",  2),   # API-Football CL = 2
+    ("EL", "UEL", "soccer_uefa_europa_league",  3),   # API-Football EL = 3
 ]
 
 EURO_RULES = CandidateRules(
@@ -125,7 +143,9 @@ def fetch_euro_fixtures(fd_key: str, odds_key: str, af_key: str = ""):
     fixture_counts: dict = {}
     all_fixtures:   list = []
 
-    for _comp_code, league_id, sport_key in EURO_COMPETITIONS:
+    af = ApiFootballClient(af_key) if af_key else None
+
+    for _comp_code, league_id, sport_key, af_league_id in EURO_COMPETITIONS:
         try:
             results = fetch_euro_competition(
                 league_id, odds, sport_key,
@@ -133,6 +153,8 @@ def fetch_euro_fixtures(fd_key: str, odds_key: str, af_key: str = ""):
                 fd_client=fd,
                 extra_results=domestic_parsed,
                 bookmaker_filter=BOOKMAKER,
+                af_client=af,
+                af_league_id=af_league_id,
             )
             all_fixtures.extend(results)
             with_odds = sum(1 for _, mo in results if mo)
@@ -140,7 +162,10 @@ def fetch_euro_fixtures(fd_key: str, odds_key: str, af_key: str = ""):
         except Exception:
             fixture_counts[league_id] = (0, 0)
 
-    return fixture_counts, all_fixtures
+    # Auto-detect first leg scores — use API-Football for full knockout coverage
+    auto_first_legs = fetch_euro_first_leg_scores(all_fixtures, fd, season=SEASON, af_client=af)
+
+    return fixture_counts, all_fixtures, auto_first_legs
 
 
 def run_model(
@@ -239,7 +264,7 @@ st.info(
 # Fetch fixtures
 # ---------------------------------------------------------------------------
 with st.spinner("Fetching European fixtures and odds..."):
-    fixture_counts, all_fixtures = fetch_euro_fixtures(fd_key, odds_key, af_key)
+    fixture_counts, all_fixtures, auto_first_legs = fetch_euro_fixtures(fd_key, odds_key, af_key)
 
 total_fixtures  = sum(v[0] for v in fixture_counts.values())
 total_with_odds = sum(v[1] for v in fixture_counts.values())
@@ -254,43 +279,82 @@ with st.expander("Competition breakdown"):
         label = "Champions League" if league == "UCL" else "Europa League"
         st.write(f"**{label}** — {total} fixtures, {with_odds} with {BOOKMAKER} odds")
 
+with st.expander("🔎 First leg detection debug"):
+    st.caption("Shows what the auto-detection found. Share this if second legs are missing.")
+    st.write(f"**Finished results fetched:** {len(auto_first_legs)} matched out of {len(all_fixtures)} upcoming fixtures")
+    st.write("**Upcoming fixture keys looked up:**")
+    for match, _ in all_fixtures:
+        key = f"{match.home_team} vs {match.away_team}"
+        reverse = f"{match.away_team} vs {match.home_team}"
+        found = key in auto_first_legs
+        score = auto_first_legs.get(key)
+        score_str = f"{score[0]}–{score[1]}" if score else "—"
+        st.write(f"{'✅' if found else '❌'} Looking for **{match.away_team} vs {match.home_team}** → {score_str}")
+
 st.divider()
 
 # ---------------------------------------------------------------------------
 # First leg scores (user input)
 # ---------------------------------------------------------------------------
-st.subheader("⚽ First leg scores  (optional)")
-st.caption(
-    "If any of the fixtures below are second legs, enter the first leg score. "
-    "Leave blank for first legs or if you don't know."
-)
+st.subheader("⚽ First leg scores")
+
+# Layer priority: auto-detected (API) > saved from last session > 0
+saved_scores = _load_saved_scores()
+prefill: Dict[str, Tuple[int, int]] = {**saved_scores, **auto_first_legs}
+
+n_auto  = len(auto_first_legs)
+n_saved = len([k for k in saved_scores if k not in auto_first_legs])
+if n_auto or n_saved:
+    parts = []
+    if n_auto:
+        parts.append(f"**{n_auto} auto-detected**")
+    if n_saved:
+        parts.append(f"**{n_saved} loaded from last session**")
+    st.success(
+        f"{' and '.join(parts)}. "
+        "Scores are pre-filled — the model applies two-leg context automatically. "
+        "Edit any score below if needed; changes are saved automatically."
+    )
+else:
+    st.caption("Enter first leg scores below. They'll be remembered next time.")
 
 first_leg_scores: Dict[str, FirstLegResult] = {}
+collected_scores: Dict[str, Tuple[int, int]] = {}
 
 if all_fixtures:
     for match, _ in all_fixtures:
         comp_label = "CL" if match.league == "UCL" else "EL"
         home_ped = pedigree_label(match.home_team)
         away_ped = pedigree_label(match.away_team)
+        key = f"{match.home_team} vs {match.away_team}"
+        pre = prefill.get(key, (0, 0))
+        is_second_leg = pre[0] > 0 or pre[1] > 0
+
+        leg_badge = " `2nd leg`" if is_second_leg else ""
         col_label, col_h, col_dash, col_a = st.columns([4, 1, 0.3, 1])
         with col_label:
             st.markdown(
-                f"**{match.home_team}**{home_ped} vs **{match.away_team}**{away_ped} `{comp_label}`"
+                f"**{match.home_team}**{home_ped} vs **{match.away_team}**{away_ped} "
+                f"`{comp_label}`{leg_badge}"
             )
         with col_h:
-            h = st.number_input("Home", min_value=0, max_value=20, value=0,
+            h = st.number_input("Home", min_value=0, max_value=20, value=int(pre[0]),
                                 key=f"h_{match.match_id}", label_visibility="collapsed")
         with col_dash:
             st.markdown("<div style='padding-top:6px;text-align:center'>–</div>",
                         unsafe_allow_html=True)
         with col_a:
-            a = st.number_input("Away", min_value=0, max_value=20, value=0,
+            a = st.number_input("Away", min_value=0, max_value=20, value=int(pre[1]),
                                 key=f"a_{match.match_id}", label_visibility="collapsed")
 
-        if h > 0 or a > 0:
-            first_leg_scores[f"{match.home_team} vs {match.away_team}"] = FirstLegResult(
-                home_scored=h, away_scored=a
-            )
+        collected_scores[key] = (h, a)
+        if h > 0 or a > 0 or key in auto_first_legs:
+            first_leg_scores[key] = FirstLegResult(home_scored=h, away_scored=a)
+
+# Auto-save any non-zero scores so they persist next session
+scores_to_save = {k: v for k, v in collected_scores.items() if v[0] > 0 or v[1] > 0}
+if scores_to_save:
+    _save_scores(scores_to_save)
 
 st.divider()
 
