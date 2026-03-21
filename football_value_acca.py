@@ -280,6 +280,9 @@ class Match:
     home_intl_absences: int = 0
     away_intl_absences: int = 0
 
+    # Head-to-head history: multiplier applied to lam_home (1.0 = neutral)
+    h2h_home_edge: float = 1.0
+
     # Data quality flags (esp. lower divisions)
     injury_info_reliable: bool = True
     league_data_quality: float = 0.75  # 0..1
@@ -560,6 +563,11 @@ class MatchModel:
             lam_away,
             lam_home,
         )
+
+        # Head-to-head history modifier (small ±4% effect)
+        if match.h2h_home_edge != 1.0:
+            lam_home *= match.h2h_home_edge
+            risk_flags.append(f"h2h_edge:{match.h2h_home_edge:.3f}")
 
         # Clamp confidence + lambdas
         confidence = clamp(confidence, 0.40, 0.90)

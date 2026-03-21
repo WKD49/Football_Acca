@@ -590,6 +590,43 @@ def build_schedule_context(
 
 
 # ---------------------------------------------------------------------------
+# Head-to-head helper
+# ---------------------------------------------------------------------------
+
+def compute_h2h_edge(home: str, away: str, results: List[dict], n: int = 6) -> float:
+    """
+    Return a lam_home multiplier based on the last N H2H meetings.
+    Range: ~0.96–1.04. Returns 1.0 (neutral) if fewer than 3 meetings found.
+
+    Counts wins/losses for the upcoming home team across all past meetings,
+    regardless of which side they were on in each individual game.
+    """
+    h2h = [
+        r for r in results
+        if (r["home"] == home and r["away"] == away)
+        or (r["home"] == away and r["away"] == home)
+    ]
+    h2h = sorted(h2h, key=lambda r: r["date"])[-n:]
+
+    if len(h2h) < 3:
+        return 1.0
+
+    home_wins = 0
+    for r in h2h:
+        if r["home"] == home:
+            hg, ag = r["home_goals"], r["away_goals"]
+        else:
+            hg, ag = r["away_goals"], r["home_goals"]
+        if hg > ag:
+            home_wins += 1
+
+    home_rate = home_wins / len(h2h)
+    # Centre on 0.33 (typical home win rate); max ±4% effect
+    edge = max(-0.04, min(0.04, (home_rate - 0.33) * 0.12))
+    return 1.0 + edge
+
+
+# ---------------------------------------------------------------------------
 # Odds parser: The Odds API event -> OddsSnapshot
 # ---------------------------------------------------------------------------
 
@@ -676,11 +713,16 @@ def fetch_competition(
     """
     calc = FormCalculator()
 
-    # Step 1: results -> form
+    # Step 1: results -> form (current season)
     raw_finished = fd_client.get_finished_matches(competition_code, season)
     parsed = [calc.parse_result(m) for m in raw_finished]
     parsed = [p for p in parsed if p is not None]
     league_home_avg, league_away_avg = calc.league_averages(parsed)
+
+    # Also fetch previous season for H2H (cached separately, no extra cost per run)
+    raw_prev = fd_client.get_finished_matches(competition_code, season - 1)
+    parsed_prev = [calc.parse_result(m) for m in raw_prev]
+    h2h_pool = parsed + [p for p in parsed_prev if p is not None]
 
     # Step 2: upcoming fixtures
     raw_upcoming = fd_client.get_upcoming_fixtures(competition_code, days_ahead)
@@ -720,6 +762,7 @@ def fetch_competition(
             away_features=away_features,
             home_schedule=home_sched,
             away_schedule=away_sched,
+            h2h_home_edge=compute_h2h_edge(home, away, h2h_pool),
             league_data_quality=data_quality,
         )
 

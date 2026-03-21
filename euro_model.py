@@ -97,19 +97,25 @@ def _two_leg_factors(first_leg: FirstLegResult) -> Tuple[float, float]:
     Return (lam_home_factor, lam_away_factor).
     Deficit = away aggregate − home aggregate.
     Positive deficit means home team is behind on aggregate.
+
+    Key insight: when the home side faces a large deficit they attack
+    desperately, leaving space that the away team exploits on the counter.
+    Both lambdas rise — total goals increase — so Under 2.5 becomes unlikely.
     """
     deficit = first_leg.away_scored - first_leg.home_scored  # from home team's POV
 
-    if deficit >= 2:
-        return 1.15, 0.90   # home trailing badly — must attack
+    if deficit >= 3:
+        return 1.25, 1.12   # home chasing 3+ — open game, both teams score
+    elif deficit == 2:
+        return 1.18, 1.06   # home chasing 2 — still open; away counter freely
     elif deficit == 1:
-        return 1.08, 0.95   # home trailing by one
+        return 1.08, 0.97   # home trailing by one — pushes forward; away cautious
     elif deficit == 0:
         return 1.02, 1.00   # level — slight home crowd boost
     elif deficit == -1:
-        return 0.95, 1.05   # home leading by one — cautious
+        return 0.93, 1.06   # home leading — sits back; away must push
     else:
-        return 0.90, 1.12   # home leading by 2+ — protect the lead
+        return 0.87, 1.10   # home protecting 2+ lead — defensive; away attacks
 
 
 # ---------------------------------------------------------------------------
