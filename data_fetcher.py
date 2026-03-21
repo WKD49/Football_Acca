@@ -18,6 +18,8 @@ Setup:
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import time
@@ -133,6 +135,20 @@ _NAME_OVERRIDES: Dict[str, str] = {
     "Wolverhampton Wanderers":   "Wolves",
     "Nottingham Forest":         "Nottm Forest",
     "Leicester":                 "Leicester City",
+    # ClubElo names -> canonical
+    "Bayern":                    "Bayern Munich",
+    "Paris SG":                  "PSG",
+    "Man City":                  "Manchester City",
+    "Man United":                "Manchester United",
+    "Atletico":                  "Atletico Madrid",
+    "Sporting":                  "Sporting CP",
+    "Newcastle":                 "Newcastle United",
+    "Dortmund":                  "Borussia Dortmund",
+    "Leverkusen":                "Bayer Leverkusen",
+    "Milan":                     "AC Milan",
+    "Forest":                    "Nottm Forest",
+    "Betis":                     "Real Betis",
+    "Celta":                     "Celta Vigo",
 }
 
 _STRIP_SUFFIXES  = (" FC", " AFC", " CF", " SC", " FK", " IF", " BK", " SK", " KV",
@@ -444,6 +460,96 @@ def fetch_api_football_results(
         except Exception:
             pass  # If one league fails, keep going with the others
     return all_results
+
+
+# ---------------------------------------------------------------------------
+# Club Elo client
+# Fetches cross-league Elo ratings from clubelo.com (free, no API key).
+# Used in the European model to compare teams from different leagues.
+# ---------------------------------------------------------------------------
+
+class EloClient:
+    """
+    Fetches club Elo ratings from api.clubelo.com.
+
+    Plain English: Elo is a single number that captures a club's overall
+    strength across all competitions. Unlike league form (which is relative
+    to league average), Elo lets us compare a Bundesliga team directly with
+    a Portuguese team — essential for European knockout fixtures.
+
+    Cached for 24 hours (ratings only update after each match day).
+    """
+
+    BASE_URL = "http://api.clubelo.com"
+
+    def fetch_ratings(self, date_str: Optional[str] = None) -> Dict[str, float]:
+        """
+        Return {canonical_team_name: elo} for all clubs on the given date.
+        date_str: "YYYY-MM-DD" (defaults to today)
+        """
+        if date_str is None:
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        cache_key = f"clubelo_{date_str}"
+        cached = _cache_load(cache_key, max_age_seconds=86400)  # 24 hours
+        if cached:
+            return cached["ratings"]
+
+        try:
+            r = requests.get(f"{self.BASE_URL}/{date_str}", timeout=10)
+            r.raise_for_status()
+            reader = csv.DictReader(io.StringIO(r.text))
+            ratings: Dict[str, float] = {}
+            for row in reader:
+                try:
+                    name = normalise_team_name(row["Club"])
+                    ratings[name] = float(row["Elo"])
+                except (KeyError, ValueError):
+                    continue
+        except Exception:
+            return {}
+
+        _cache_save(cache_key, {"ratings": ratings})
+        return ratings
+
+
+def _apply_elo_factors(
+    home_tf: "TeamFeatures",
+    away_tf: "TeamFeatures",
+    home_elo: float,
+    away_elo: float,
+    alpha: float = 0.4,
+) -> Tuple["TeamFeatures", "TeamFeatures"]:
+    """
+    Adjust TeamFeatures attack multipliers based on the Elo difference.
+
+    Plain English: if Real Madrid (Elo 1956) faces Galatasaray (Elo 1650),
+    Real Madrid's attack is boosted ~5% and Galatasaray's is cut ~5%.
+    This corrects for the fact that league-relative form cannot compare
+    teams across different countries.
+
+    alpha controls sensitivity: 0.4 gives ~2–6% adjustment for typical
+    CL matchups (100–300 Elo point gaps). Capped at ±15%.
+    """
+    avg_elo = (home_elo + away_elo) / 2.0
+    home_factor = max(0.85, min(1.15, (home_elo / avg_elo) ** alpha))
+    away_factor = max(0.85, min(1.15, (away_elo / avg_elo) ** alpha))
+
+    def scale_tf(tf: "TeamFeatures", factor: float) -> "TeamFeatures":
+        from football_value_acca import TeamFeatures as TF
+        return TF(
+            home_attack_long=  tf.home_attack_long  * factor,
+            home_attack_short= tf.home_attack_short * factor,
+            home_defence_long= tf.home_defence_long,
+            home_defence_short=tf.home_defence_short,
+            away_attack_long=  tf.away_attack_long  * factor,
+            away_attack_short= tf.away_attack_short * factor,
+            away_defence_long= tf.away_defence_long,
+            away_defence_short=tf.away_defence_short,
+            strict_validation=False,
+        )
+
+    return scale_tf(home_tf, home_factor), scale_tf(away_tf, away_factor)
 
 
 # ---------------------------------------------------------------------------
@@ -1018,6 +1124,9 @@ def fetch_euro_competition(
 
     output: List[Tuple[Match, List[Tuple[Market, OddsSnapshot]]]] = []
 
+    # ── Club Elo ratings (cross-league strength calibration) ─────────────
+    elo_ratings: Dict[str, float] = EloClient().fetch_ratings()
+
     # ── Fixture source: API-Football (complete CL/EL coverage) if available,
     #    otherwise fall back to The Odds API events ─────────────────────────
     af_upcoming: List[dict] = []
@@ -1036,6 +1145,12 @@ def fetch_euro_competition(
             hf = _NEUTRAL_FEATURES
             af_ = _NEUTRAL_FEATURES
             dq = 0.60
+
+        # Apply Elo-based cross-league strength adjustment if both teams are rated
+        home_elo = elo_ratings.get(home)
+        away_elo = elo_ratings.get(away)
+        if home_elo and away_elo:
+            hf, af_ = _apply_elo_factors(hf, af_, home_elo, away_elo)
 
         m = Match(
             match_id=match_id,
