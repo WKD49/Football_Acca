@@ -47,12 +47,12 @@ DAYS_AHEAD = 7       # how many days of upcoming fixtures to fetch
 BOOKMAKER = "paddypower"  # also try "ladbrokes_uk"
 
 # Value detection thresholds
-# edge = how much our model probability exceeds the bookmaker's implied probability
-# e.g. min_edge=0.03 means we only bet if we think the bookmaker is 3%+ wrong
+# EV = (model_prob × decimal_odds) - 1. Primary filter: require 4% EV.
+# min_edge is a backstop — prevents recommending bets with tiny probability edges.
 RULES = CandidateRules(
-    min_edge=0.03,
+    min_ev=0.04,
+    min_edge=0.01,
     min_confidence=0.55,
-    require_positive_ev=True,
 )
 
 # Accumulator constraints (3–5 legs, max odds tightened to avoid lottery tickets)

@@ -636,7 +636,8 @@ class MarketPricer:
 
 @dataclass(frozen=True)
 class CandidateRules:
-    min_edge: float = 0.03
+    min_ev: float = 0.04          # primary filter: require 4% expected value
+    min_edge: float = 0.01        # backstop: at least 1% probability edge
     min_confidence: float = 0.55
     require_positive_ev: bool = True
     odds_stale_hours: float = 12.0
@@ -686,7 +687,7 @@ def build_candidate(
         return None
     if edge < rules.min_edge:
         return None
-    if rules.require_positive_ev and ev <= 0.0:
+    if ev < rules.min_ev:
         return None
 
     tags.extend([

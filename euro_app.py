@@ -66,9 +66,9 @@ EURO_COMPETITIONS = [
 ]
 
 EURO_RULES = CandidateRules(
-    min_edge=0.03,
+    min_ev=0.04,
+    min_edge=0.01,
     min_confidence=0.58,
-    require_positive_ev=True,
 )
 
 EURO_CONSTRAINTS = AccaConstraints(

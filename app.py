@@ -13,7 +13,7 @@ from itertools import combinations
 
 import streamlit as st
 
-from data_fetcher import FootballDataClient, OddsApiClient, fetch_competition
+from data_fetcher import FootballDataClient, OddsApiClient, fetch_competition, FormCalculator
 from football_value_acca import (
     LEAGUE_CONFIGS, MarketPricer, MatchModel,
     build_accas_beam_search, build_candidate,
@@ -23,6 +23,7 @@ from run import (
     RULES, SEASON, YANKEE_MAX_ODDS,
     confidence_label, format_selection, win_prob_label, yankee_score,
 )
+import calibration
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -120,7 +121,18 @@ def fetch_all(fd_key: str, odds_key: str):
         })
     goal_predictions.sort(key=lambda x: x["pred_total"], reverse=True)
 
-    return fixture_counts, candidates, accas, yankee_pool, goal_predictions, now
+    # Collect all finished results (from cache) for calibration outcome checking
+    calc = FormCalculator()
+    all_parsed: list = []
+    for comp_code, league_id, sport_key in COMPETITIONS:
+        try:
+            raw = fd.get_finished_matches(comp_code, SEASON)
+            all_parsed.extend(r for r in (calc.parse_result(m) for m in raw) if r)
+        except Exception:
+            pass
+
+
+    return fixture_counts, candidates, accas, yankee_pool, goal_predictions, all_parsed, now
 
 
 # ---------------------------------------------------------------------------
@@ -150,9 +162,15 @@ with col_btn:
 # Fetch data
 # ---------------------------------------------------------------------------
 with st.spinner("Fetching fixtures and odds..."):
-    fixture_counts, candidates, accas, yankee_pool, goal_predictions, fetched_at = fetch_all(fd_key, odds_key)
+    fixture_counts, candidates, accas, yankee_pool, goal_predictions, all_parsed, fetched_at = fetch_all(fd_key, odds_key)
 
 st.caption(f"Last updated: {fetched_at.strftime('%d %b %Y  %H:%M')} UTC")
+
+# Log this run's predictions and update CLV on any pending bets
+_now = datetime.now(timezone.utc)
+_new = calibration.log_predictions(candidates, _now)
+calibration.update_clv(candidates, _now)
+calibration.update_outcomes(all_parsed, _now)
 
 # ---------------------------------------------------------------------------
 # Summary metrics
@@ -173,7 +191,7 @@ with st.expander("League breakdown"):
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_value, tab_goals, tab_odds = st.tabs(["📋 Value Bets & Accas", "⚽ High-Scoring Games", "🔢 Odds Translator"])
+tab_value, tab_goals, tab_odds, tab_cal = st.tabs(["📋 Value Bets & Accas", "⚽ High-Scoring Games", "🔢 Odds Translator", "📊 Calibration"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -181,12 +199,19 @@ tab_value, tab_goals, tab_odds = st.tabs(["📋 Value Bets & Accas", "⚽ High-S
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_value:
 
-    # Value bets
-    st.subheader("📋 Value bets this week")
+    # ── Singles & Doubles (primary recommendation) ───────────────────────────
+    st.subheader("⭐ Top picks — Singles & Doubles")
+    st.caption(
+        "These are the model's highest expected-value bets. "
+        "Singles and doubles give you the best risk/reward ratio — "
+        "variance stays manageable and the edge compounds cleanly."
+    )
+
     if not candidates:
         st.info("No value bets found this week. Try again closer to the weekend when more fixtures have odds.")
     else:
-        for c in candidates:
+        top = candidates[:6]
+        for c in top:
             bookie_implied = 1 / c.odds.decimal_odds
             st.markdown(
                 f"**{c.home_team} vs {c.away_team}** `{c.league}` &nbsp;·&nbsp; "
@@ -194,14 +219,35 @@ with tab_value:
                 f"Odds **{c.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
                 f"Our estimate: **{c.model_prob:.0%}** &nbsp;·&nbsp; "
                 f"Bookie implies: {bookie_implied:.0%} &nbsp;·&nbsp; "
-                f"Edge: **{c.edge:+.0%}** &nbsp;·&nbsp; "
+                f"EV: **{c.ev:+.0%}** &nbsp;·&nbsp; "
                 f"{conf_badge(c.confidence)}"
             )
 
+        # Best doubles from the top picks
+        if len(top) >= 2:
+            st.markdown("##### Best doubles")
+            from itertools import combinations as _comb
+            doubles = sorted(
+                [(a, b, a.ev + b.ev, a.odds.decimal_odds * b.odds.decimal_odds)
+                 for a, b in _comb(top, 2)
+                 if a.home_team != b.home_team and a.away_team != b.away_team],
+                key=lambda x: x[2], reverse=True
+            )
+            for a, b, combined_ev, combined_odds in doubles[:3]:
+                st.markdown(
+                    f"✦ **{a.home_team} vs {a.away_team}** {format_selection(a.market)} @ {a.odds.decimal_odds:.2f}"
+                    f"  +  **{b.home_team} vs {b.away_team}** {format_selection(b.market)} @ {b.odds.decimal_odds:.2f}"
+                    f" &nbsp;·&nbsp; Double odds: **{combined_odds:.2f}** &nbsp;·&nbsp; Combined EV: **{combined_ev:+.0%}**"
+                )
+
     st.divider()
 
-    # Straight accumulators
-    st.subheader(f"🎯 Accumulator suggestions  ({CONSTRAINTS.min_legs}–{CONSTRAINTS.max_legs} legs, all must win)")
+    # ── Accumulators (secondary — higher variance) ───────────────────────────
+    st.subheader(f"🎯 Accumulators  ({CONSTRAINTS.min_legs}–{CONSTRAINTS.max_legs} legs)")
+    st.caption(
+        "⚠️ Accumulators compound variance fast. All legs must win. "
+        "Treat these as entertainment — size stakes accordingly."
+    )
     if not accas:
         st.info("Not enough value bets to build an accumulator this week.")
     else:
@@ -218,7 +264,7 @@ with tab_value:
                         f"{format_selection(leg.market)} "
                         f"@ **{leg.odds.decimal_odds:.2f}** &nbsp;·&nbsp; "
                         f"Our estimate: {leg.model_prob:.0%} &nbsp;·&nbsp; "
-                        f"Edge: {leg.edge:+.0%}"
+                        f"EV: {leg.ev:+.0%}"
                     )
 
     # Yankee / Super Yankee
@@ -452,3 +498,73 @@ with tab_odds:
         "|---|---|---|\n" +
         "\n".join(f"| {f} | {d} | {p} |" for f, d, p in ref_data)
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 4 — Calibration
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_cal:
+    st.subheader("📊 Model Calibration")
+    st.caption(
+        "Tracks this model's predictions against actual results over time. "
+        "Builds up automatically each week — the more weeks recorded, the more meaningful the stats."
+    )
+
+    summary = calibration.get_summary()
+
+    if summary["resolved"] < 5:
+        st.info(
+            f"**{summary.get('total', 0)} predictions logged, {summary['resolved']} resolved so far.** "
+            "Keep running the model each week — calibration stats become meaningful after ~20 resolved bets."
+        )
+        if _new:
+            st.success(f"{_new} new prediction(s) logged this run.")
+    else:
+        n = summary["resolved"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Bets tracked", summary["total"])
+        c2.metric("Resolved", n)
+        c3.metric("Win rate", f"{summary['win_rate']:.0%}")
+        c4.metric("Brier score", f"{summary['brier']:.3f}", help="Lower is better. 0.25 = random guessing.")
+
+        if summary["clv_mean"] is not None:
+            st.metric(
+                "Avg Closing Line Value",
+                f"{summary['clv_mean']:+.3f}",
+                help="Positive = our odds were better than closing odds (model found value before market corrected)."
+            )
+
+        st.divider()
+
+        # Calibration buckets
+        st.markdown("#### Predicted probability vs actual win rate")
+        st.caption("If the model is well-calibrated, each bar should be close to its label.")
+        buckets = summary["buckets"]
+        if buckets:
+            for band, data in sorted(buckets.items()):
+                actual = data["wins"] / data["total"] if data["total"] else 0
+                st.markdown(
+                    f"**{band}** — predicted | actual win rate: **{actual:.0%}** "
+                    f"({data['wins']}/{data['total']} bets)"
+                )
+
+        st.divider()
+
+        # By league
+        st.markdown("#### Win rate by league")
+        for lg, data in sorted(summary["by_league"].items()):
+            wr = data["wins"] / data["total"] if data["total"] else 0
+            st.markdown(f"**{lg}** — {wr:.0%} ({data['wins']}/{data['total']})")
+
+        st.divider()
+
+        # Recent predictions log
+        with st.expander("Full prediction log"):
+            for e in sorted(summary["entries"], key=lambda x: x["kickoff_utc"], reverse=True)[:50]:
+                status = "✅" if e["outcome"] is True else ("❌" if e["outcome"] is False else "⏳")
+                clv = f" CLV: {e['bookie_odds'] - e['closing_odds']:+.2f}" if e.get("closing_odds") else ""
+                st.markdown(
+                    f"{status} **{e['home_team']} vs {e['away_team']}** `{e['league']}` "
+                    f"{e['market']} @ {e['bookie_odds']:.2f} | "
+                    f"model: {e['model_prob']:.0%} | EV: {e['ev']:+.0%}{clv}"
+                )
