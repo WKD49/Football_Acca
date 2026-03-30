@@ -382,6 +382,18 @@ LEAGUE_CONFIGS: Dict[str, LeagueConfig] = {
     # France Ligue 1 (~2.6 goals/match)
     "LIGUE1":       LeagueConfig("LIGUE1",       base_goal_rate=1.30, home_adv_multiplier=1.06, is_lower_tier=False),
 
+    # Germany Bundesliga 2 (~2.7 goals/match; more open than Bundesliga)
+    "BUNDESLIGA2":  LeagueConfig("BUNDESLIGA2",  base_goal_rate=1.35, home_adv_multiplier=1.07, is_lower_tier=False),
+
+    # Italy Serie B (~2.4 goals/match; more defensive than Serie A)
+    "SERIEB":       LeagueConfig("SERIEB",       base_goal_rate=1.20, home_adv_multiplier=1.07, is_lower_tier=False),
+
+    # France Ligue 2 (~2.5 goals/match)
+    "LIGUE2":       LeagueConfig("LIGUE2",       base_goal_rate=1.25, home_adv_multiplier=1.06, is_lower_tier=False),
+
+    # Mexico Liga MX (~2.7 goals/match; strong home advantage)
+    "LIGAMX":       LeagueConfig("LIGAMX",       base_goal_rate=1.35, home_adv_multiplier=1.12, is_lower_tier=False),
+
     # UEFA Champions League (~2.7 goals/match; used as European baseline)
     "UCL":          LeagueConfig("UCL",          base_goal_rate=1.35, home_adv_multiplier=1.06, is_lower_tier=False),
 

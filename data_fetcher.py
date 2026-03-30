@@ -66,6 +66,10 @@ ODDS_SPORT_MAP: Dict[str, str] = {
     "soccer_japan_j_league":         "JLEAGUE",
     "soccer_australia_aleague":      "ALEAGUE",
     "soccer_brazil_campeonato":      "BRASILEIRAO",  # bonus — on both APIs
+    "soccer_germany_bundesliga2":    "BUNDESLIGA2",
+    "soccer_italy_serie_b":          "SERIEB",
+    "soccer_france_ligue_two":       "LIGUE2",
+    "soccer_mexico_ligamx":          "LIGAMX",
 }
 
 # European competition names (used to detect Europe midweek penalty flag)
@@ -327,8 +331,12 @@ class OddsApiClient:
 # API-Football league IDs -> our internal league IDs
 AF_LEAGUE_MAP: Dict[int, str] = {
     78:  "BUNDESLIGA",
+    79:  "BUNDESLIGA2",
     135: "SERIEA",
+    136: "SERIEB",
     61:  "LIGUE1",
+    62:  "LIGUE2",
+    262: "LIGAMX",
 }
 
 
