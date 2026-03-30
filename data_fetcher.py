@@ -70,6 +70,7 @@ ODDS_SPORT_MAP: Dict[str, str] = {
     "soccer_italy_serie_b":          "SERIEB",
     "soccer_france_ligue_two":       "LIGUE2",
     "soccer_mexico_ligamx":          "LIGAMX",
+    "soccer_brazil_serie_b":         "BRASILEIRAO_B",
 }
 
 # European competition names (used to detect Europe midweek penalty flag)
@@ -337,6 +338,7 @@ AF_LEAGUE_MAP: Dict[int, str] = {
     61:  "LIGUE1",
     62:  "LIGUE2",
     262: "LIGAMX",
+    72:  "BRASILEIRAO_B",
 }
 
 

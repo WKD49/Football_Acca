@@ -394,6 +394,9 @@ LEAGUE_CONFIGS: Dict[str, LeagueConfig] = {
     # Mexico Liga MX (~2.7 goals/match; strong home advantage)
     "LIGAMX":       LeagueConfig("LIGAMX",       base_goal_rate=1.35, home_adv_multiplier=1.12, is_lower_tier=False),
 
+    # Brazil Série B (~2.5 goals/match)
+    "BRASILEIRAO_B": LeagueConfig("BRASILEIRAO_B", base_goal_rate=1.25, home_adv_multiplier=1.10, is_lower_tier=False),
+
     # UEFA Champions League (~2.7 goals/match; used as European baseline)
     "UCL":          LeagueConfig("UCL",          base_goal_rate=1.35, home_adv_multiplier=1.06, is_lower_tier=False),
 
