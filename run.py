@@ -16,7 +16,7 @@ from dotenv import load_dotenv; load_dotenv()
 from datetime import datetime, timezone
 from itertools import combinations
 
-from data_fetcher import FootballDataClient, OddsApiClient, fetch_competition
+from data_fetcher import FootballDataClient, OddsApiClient, ApiFootballClient, fetch_competition, fetch_competition_af
 from football_value_acca import (
     AccaConstraints,
     BetCandidate,
@@ -75,6 +75,17 @@ COMPETITIONS = [
     ("BL1", "BUNDESLIGA", "soccer_germany_bundesliga"),
     ("SA",  "SERIEA",     "soccer_italy_serie_a"),
     ("FL1", "LIGUE1",     "soccer_france_ligue_one"),
+]
+
+# Leagues sourced from API-Football (not on football-data.org free tier)
+# Format: (league_id, af_league_id, odds_sport_key)
+AF_COMPETITIONS = [
+    ("BUNDESLIGA2",  79,  "soccer_germany_bundesliga2"),
+    ("SERIEB",      136,  "soccer_italy_serie_b"),
+    ("LIGUE2",       62,  "soccer_france_ligue_two"),
+    ("LIGAMX",      262,  "soccer_mexico_ligamx"),
+    ("BRASILEIRAO",  71,  "soccer_brazil_campeonato"),
+    ("BRASILEIRAO_B", 72, "soccer_brazil_serie_b"),
 ]
 
 # Max individual odds for Yankee/Super Yankee selections (long shots make bad Yankees)
@@ -187,8 +198,9 @@ def print_coverage_bet(label: str, num_bets: int, selections: list) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    fd_key   = os.environ.get("FOOTBALL_DATA_KEY", "")
-    odds_key = os.environ.get("ODDS_API_KEY", "")
+    fd_key      = os.environ.get("FOOTBALL_DATA_KEY", "")
+    odds_key    = os.environ.get("ODDS_API_KEY", "")
+    rapid_key   = os.environ.get("RAPID_API_KEY", "")
 
     if not fd_key or not odds_key:
         print("API keys not set. Run:")
@@ -198,6 +210,7 @@ def main() -> None:
 
     fd   = FootballDataClient(fd_key)
     odds = OddsApiClient(odds_key)
+    af   = ApiFootballClient(rapid_key) if rapid_key else None
     now  = datetime.now(timezone.utc)
 
     model  = MatchModel(LEAGUE_CONFIGS)
@@ -219,9 +232,25 @@ def main() -> None:
             )
             all_fixtures.extend(results)
             fixtures_with_odds = sum(1 for _, mo in results if mo)
-            print(f"  {league_id:10} {len(results)} fixtures, {fixtures_with_odds} with {bookie_label} odds")
+            print(f"  {league_id:12} {len(results)} fixtures, {fixtures_with_odds} with {bookie_label} odds")
         except Exception as e:
-            print(f"  {league_id:10} ERROR: {e}")
+            print(f"  {league_id:12} ERROR: {e}")
+
+    if af:
+        for league_id, af_league_id, sport_key in AF_COMPETITIONS:
+            try:
+                results = fetch_competition_af(
+                    league_id, af_league_id, sport_key, af, odds,
+                    season=SEASON, days_ahead=DAYS_AHEAD,
+                    bookmaker_filter=BOOKMAKER,
+                )
+                all_fixtures.extend(results)
+                fixtures_with_odds = sum(1 for _, mo in results if mo)
+                print(f"  {league_id:12} {len(results)} fixtures, {fixtures_with_odds} with {bookie_label} odds")
+            except Exception as e:
+                print(f"  {league_id:12} ERROR: {e}")
+    else:
+        print("  (RAPID_API_KEY not set — skipping AF leagues)")
 
     print(f"\n  Total: {len(all_fixtures)} fixtures\n")
 
@@ -239,29 +268,7 @@ def main() -> None:
     print_candidates(candidates)
 
     # -----------------------------------------------------------------------
-    # Step 3: straight accumulators (3–5 legs)
-    # -----------------------------------------------------------------------
-    print(f"\n{'='*60}")
-    print("  ACCUMULATOR SUGGESTIONS  (all legs must win)")
-    print(f"{'='*60}")
-    print(f"  {CONSTRAINTS.min_legs}–{CONSTRAINTS.max_legs} selections  |  "
-          f"Target odds: {CONSTRAINTS.min_total_decimal_odds:.0f}/1 – {CONSTRAINTS.soft_max_total_decimal_odds:.0f}/1")
-
-    if len(candidates) >= CONSTRAINTS.min_legs:
-        accas = build_accas_beam_search(candidates, CONSTRAINTS, OPT)
-        if accas:
-            top = accas[:5]
-            print(f"\n  Top {len(top)} accumulator(s):\n")
-            for i, acca in enumerate(top):
-                print_acca(i, acca)
-        else:
-            print("\n  No accas found in the target odds range.")
-            print("  The individual value bets above may still be worth placing as singles.")
-    else:
-        print(f"\n  Not enough value bets ({len(candidates)}) to build a {CONSTRAINTS.min_legs}-leg acca.")
-
-    # -----------------------------------------------------------------------
-    # Step 4: Yankee + Super Yankee (shorter-odds selections only)
+    # Step 3: Yankee + Super Yankee (shorter-odds selections only)
     # -----------------------------------------------------------------------
     yankee_pool = sorted(
         [c for c in candidates if c.odds.decimal_odds <= YANKEE_MAX_ODDS],

@@ -238,7 +238,7 @@ class FootballDataClient:
         season: the year the season starts (e.g. 2024 = 2024/25)
         """
         cache_key = f"fd_{competition_code}_{season}_finished"
-        cached = _cache_load(cache_key, max_age_seconds=3600)
+        cached = _cache_load(cache_key, max_age_seconds=86400)  # 24 hours — historical results don't change
         if cached:
             return cached["matches"]
 
@@ -1038,6 +1038,102 @@ def fetch_competition(
             for sel in ("OVER", "UNDER"):
                 snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=bookmaker_filter)
                 # Fall back to best available if chosen bookmaker doesn't offer totals
+                if snap is None and bookmaker_filter:
+                    snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=None)
+                if snap:
+                    market_odds.append((Market(kind="OVER_UNDER", line=2.5, selection=sel), snap))
+
+        output.append((match, market_odds))
+
+    return output
+
+
+# ---------------------------------------------------------------------------
+# API-Football domestic fetch
+# For leagues not on football-data.org (Bundesliga 2, Serie B, Ligue 2, etc.)
+# Uses API-Football for form + upcoming fixtures; The Odds API for odds.
+# ---------------------------------------------------------------------------
+
+def fetch_competition_af(
+    league_id: str,
+    af_league_id: int,
+    odds_sport_key: str,
+    af_client: ApiFootballClient,
+    odds_client: OddsApiClient,
+    season: int,
+    days_ahead: int = 7,
+    bookmaker_filter: Optional[str] = None,
+) -> List[Tuple[Match, List[Tuple[Market, OddsSnapshot]]]]:
+    """
+    Full pipeline for leagues sourced from API-Football (not football-data.org).
+    Same output format as fetch_competition().
+    """
+    calc = FormCalculator()
+
+    # Form data — current season
+    raw_finished = af_client.get_finished_matches(af_league_id, season)
+    if not raw_finished:
+        raw_finished = af_client.get_finished_matches(af_league_id, season - 1)
+    parsed = [af_client.parse_result(m) for m in raw_finished]
+    parsed = [p for p in parsed if p is not None]
+
+    league_home_avg, league_away_avg = calc.league_averages(parsed)
+
+    # H2H pool — add previous season
+    raw_prev = af_client.get_finished_matches(af_league_id, season - 1)
+    parsed_prev = [af_client.parse_result(m) for m in raw_prev]
+    h2h_pool = parsed + [p for p in parsed_prev if p is not None]
+
+    # Upcoming fixtures
+    raw_upcoming = af_client.get_upcoming_fixtures(af_league_id, season, days_ahead=days_ahead)
+
+    # Odds
+    odds_events = odds_client.get_odds(odds_sport_key)
+    odds_lookup: Dict[Tuple[str, str], dict] = {}
+    for ev in odds_events:
+        h = normalise_team_name(ev.get("home_team", ""))
+        a = normalise_team_name(ev.get("away_team", ""))
+        odds_lookup[(h, a)] = ev
+
+    output: List[Tuple[Match, List[Tuple[Market, OddsSnapshot]]]] = []
+    data_quality = 0.75
+
+    for raw in raw_upcoming:
+        try:
+            home = normalise_team_name(raw["teams"]["home"]["name"])
+            away = normalise_team_name(raw["teams"]["away"]["name"])
+            kickoff = datetime.fromisoformat(raw["fixture"]["date"].replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+
+        home_features = calc.compute(home, parsed, league_home_avg, league_away_avg)
+        away_features = calc.compute(away, parsed, league_home_avg, league_away_avg)
+        home_sched = build_schedule_context(home, kickoff, parsed)
+        away_sched = build_schedule_context(away, kickoff, parsed)
+
+        match = Match(
+            match_id=str(raw.get("fixture", {}).get("id", f"{league_id}_{home}_{away}")),
+            league=league_id,
+            kickoff_utc=kickoff,
+            home_team=home,
+            away_team=away,
+            home_features=home_features,
+            away_features=away_features,
+            home_schedule=home_sched,
+            away_schedule=away_sched,
+            h2h_home_edge=compute_h2h_edge(home, away, h2h_pool),
+            league_data_quality=data_quality,
+        )
+
+        market_odds: List[Tuple[Market, OddsSnapshot]] = []
+        ev = odds_lookup.get((home, away))
+        if ev:
+            for sel in ("HOME", "DRAW", "AWAY"):
+                snap = best_odds_for_selection(ev, "1X2", sel, bookmaker_filter=bookmaker_filter)
+                if snap:
+                    market_odds.append((Market(kind="1X2", selection=sel), snap))
+            for sel in ("OVER", "UNDER"):
+                snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=bookmaker_filter)
                 if snap is None and bookmaker_filter:
                     snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=None)
                 if snap:
