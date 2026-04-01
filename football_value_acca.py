@@ -287,6 +287,13 @@ class Match:
     injury_info_reliable: bool = True
     league_data_quality: float = 0.75  # 0..1
 
+    # Actual league averages derived from real season data (optional).
+    # When set, these override cfg.base_goal_rate and cfg.home_adv_multiplier
+    # so the model is anchored to what has actually happened this season
+    # rather than a hardcoded estimate.
+    actual_home_avg: Optional[float] = None  # avg goals scored by home teams
+    actual_away_avg: Optional[float] = None  # avg goals scored by away teams
+
 
 @dataclass(frozen=True)
 class Market:
@@ -455,9 +462,20 @@ class MatchModel:
                                   match.away_features.away_defence_short,
                                   cfg.is_lower_tier)
 
-        # Base lambdas
-        lam_home = cfg.base_goal_rate * home_attack * away_defence * cfg.home_adv_multiplier
-        lam_away = cfg.base_goal_rate * away_attack * home_defence
+        # Base lambdas — use real season averages if available, otherwise fall back
+        # to the hardcoded LeagueConfig estimates.
+        # actual_away_avg ≈ neutral base rate (no home advantage baked in)
+        # actual_home_avg / actual_away_avg ≈ real home advantage multiplier
+        if (match.actual_away_avg and match.actual_home_avg
+                and match.actual_away_avg > 0.5 and match.actual_home_avg > 0.5):
+            base_rate = match.actual_away_avg
+            home_adv  = match.actual_home_avg / match.actual_away_avg
+        else:
+            base_rate = cfg.base_goal_rate
+            home_adv  = cfg.home_adv_multiplier
+
+        lam_home = base_rate * home_attack * away_defence * home_adv
+        lam_away = base_rate * away_attack * home_defence
 
         # Confidence baseline
         confidence = 0.75 + 0.05 * clamp(match.league_data_quality - 0.75, -1.0, 1.0)

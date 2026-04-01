@@ -13,13 +13,13 @@ from itertools import combinations
 
 import streamlit as st
 
-from data_fetcher import FootballDataClient, OddsApiClient, fetch_competition, FormCalculator
+from data_fetcher import FootballDataClient, OddsApiClient, ApiFootballClient, fetch_competition, fetch_competition_af, FormCalculator
 from football_value_acca import (
     LEAGUE_CONFIGS, MarketPricer, MatchModel,
     build_accas_beam_search, build_candidate,
 )
 from run import (
-    BOOKMAKER, COMPETITIONS, CONSTRAINTS, DAYS_AHEAD, OPT,
+    AF_COMPETITIONS, BOOKMAKER, COMPETITIONS, CONSTRAINTS, DAYS_AHEAD, MAX_BETS_PER_FIXTURE, OPT,
     RULES, SEASON, YANKEE_MAX_ODDS,
     confidence_label, format_selection, win_prob_label, yankee_score,
 )
@@ -56,9 +56,10 @@ def conf_badge(conf: float) -> str:
 # Data fetching — cached for 30 minutes
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_all(fd_key: str, odds_key: str):
+def fetch_all(fd_key: str, odds_key: str, rapid_key: str):
     fd    = FootballDataClient(fd_key)
     odds  = OddsApiClient(odds_key)
+    af    = ApiFootballClient(rapid_key) if rapid_key else None
     now   = datetime.now(timezone.utc)
     model  = MatchModel(LEAGUE_CONFIGS)
     pricer = MarketPricer(max_goals=10)
@@ -79,6 +80,20 @@ def fetch_all(fd_key: str, odds_key: str):
         except Exception:
             fixture_counts[league_id] = (0, 0)
 
+    if af:
+        for league_id, af_league_id, sport_key in AF_COMPETITIONS:
+            try:
+                results = fetch_competition_af(
+                    league_id, af_league_id, sport_key, af, odds,
+                    season=SEASON, days_ahead=DAYS_AHEAD,
+                    bookmaker_filter=BOOKMAKER,
+                )
+                all_fixtures.extend(results)
+                with_odds = sum(1 for _, mo in results if mo)
+                fixture_counts[league_id] = (len(results), with_odds)
+            except Exception:
+                fixture_counts[league_id] = (0, 0)
+
     # Value bet candidates (edge-filtered)
     candidates: list = []
     for match, market_odds in all_fixtures:
@@ -86,6 +101,16 @@ def fetch_all(fd_key: str, odds_key: str):
             c = build_candidate(match, market, snap, model, pricer, now, RULES)
             if c:
                 candidates.append(c)
+
+    # Per-fixture cap — keep the best MAX_BETS_PER_FIXTURE bets per match
+    seen: dict = {}
+    capped: list = []
+    for c in sorted(candidates, key=lambda x: x.ev, reverse=True):
+        key = (c.home_team, c.away_team)
+        if seen.get(key, 0) < MAX_BETS_PER_FIXTURE:
+            capped.append(c)
+            seen[key] = seen.get(key, 0) + 1
+    candidates = capped
 
     accas: list = []
     if len(candidates) >= CONSTRAINTS.min_legs:
@@ -140,8 +165,9 @@ def fetch_all(fd_key: str, odds_key: str):
 # ---------------------------------------------------------------------------
 st.title("⚽ Football Acca Advisor")
 
-fd_key   = os.environ.get("FOOTBALL_DATA_KEY", "")
-odds_key = os.environ.get("ODDS_API_KEY", "")
+fd_key     = os.environ.get("FOOTBALL_DATA_KEY", "")
+odds_key   = os.environ.get("ODDS_API_KEY", "")
+rapid_key  = os.environ.get("RAPID_API_KEY", "")
 
 if not fd_key or not odds_key:
     st.error("API keys not set. In your terminal run:\n\n"
@@ -162,7 +188,7 @@ with col_btn:
 # Fetch data
 # ---------------------------------------------------------------------------
 with st.spinner("Fetching fixtures and odds..."):
-    fixture_counts, candidates, accas, yankee_pool, goal_predictions, all_parsed, fetched_at = fetch_all(fd_key, odds_key)
+    fixture_counts, candidates, accas, yankee_pool, goal_predictions, all_parsed, fetched_at = fetch_all(fd_key, odds_key, rapid_key)
 
 st.caption(f"Last updated: {fetched_at.strftime('%d %b %Y  %H:%M')} UTC")
 
@@ -273,6 +299,24 @@ with tab_value:
         f"You win something as long as 2 or more selections come in. "
         f"Only picks with odds under {YANKEE_MAX_ODDS:.1f} are included here."
     )
+
+    # xG-backed leagues only — higher signal quality
+    XG_LEAGUES = {"EPL", "LALIGA", "BUNDESLIGA", "SERIEA", "LIGUE1"}
+    xg_pool = sorted(
+        [c for c in candidates
+         if c.odds.decimal_odds <= YANKEE_MAX_ODDS and c.league in XG_LEAGUES],
+        key=yankee_score, reverse=True,
+    )
+
+    if len(xg_pool) >= 4:
+        st.markdown("##### ⭐ xG-backed leagues only (EPL, La Liga, Bundesliga, Serie A, Ligue 1)")
+        st.caption("These picks come only from leagues where the model uses expected goals (xG) data — higher signal quality.")
+        show_coverage_bet("xG Yankee", 11, xg_pool[:4])
+        if len(xg_pool) >= 5:
+            show_coverage_bet("xG Super Yankee (Canadian)", 26, xg_pool[:5])
+        st.divider()
+
+    st.markdown("##### All leagues (including form-only)")
 
     def show_coverage_bet(label: str, num_bets: int, selections: list) -> None:
         header = f"{label}  —  {num_bets} bets  (£1 per bet = £{num_bets} total stake)"

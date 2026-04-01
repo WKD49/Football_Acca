@@ -51,9 +51,11 @@ BOOKMAKER = "paddypower"  # also try "ladbrokes_uk"
 # min_edge is a backstop — prevents recommending bets with tiny probability edges.
 RULES = CandidateRules(
     min_ev=0.04,
-    min_edge=0.01,
+    min_edge=0.08,   # raised from 0.01 — cuts noise, keeps only meaningful edges
     min_confidence=0.55,
 )
+
+MAX_BETS_PER_FIXTURE = 2  # cap per match to avoid one game dominating the list
 
 # Accumulator constraints (3–5 legs, max odds tightened to avoid lottery tickets)
 CONSTRAINTS = AccaConstraints(
@@ -83,9 +85,6 @@ AF_COMPETITIONS = [
     ("BUNDESLIGA2",  79,  "soccer_germany_bundesliga2"),
     ("SERIEB",      136,  "soccer_italy_serie_b"),
     ("LIGUE2",       62,  "soccer_france_ligue_two"),
-    ("LIGAMX",      262,  "soccer_mexico_ligamx"),
-    ("BRASILEIRAO",  71,  "soccer_brazil_campeonato"),
-    ("BRASILEIRAO_B", 72, "soccer_brazil_serie_b"),
 ]
 
 # Max individual odds for Yankee/Super Yankee selections (long shots make bad Yankees)
@@ -264,11 +263,18 @@ def main() -> None:
             if c:
                 candidates.append(c)
 
-    print(f"Value bets identified this week: {len(candidates)}\n")
-    print_candidates(candidates)
+    # Apply per-fixture cap — keep the best MAX_BETS_PER_FIXTURE bets per match
+    seen: dict = {}
+    capped: list = []
+    for c in sorted(candidates, key=lambda x: x.ev, reverse=True):
+        key = (c.home_team, c.away_team)
+        if seen.get(key, 0) < MAX_BETS_PER_FIXTURE:
+            capped.append(c)
+            seen[key] = seen.get(key, 0) + 1
+    candidates = capped
 
     # -----------------------------------------------------------------------
-    # Step 3: Yankee + Super Yankee (shorter-odds selections only)
+    # Step 3: Yankee + Super Yankee (shorter-odds selections only) — shown first
     # -----------------------------------------------------------------------
     yankee_pool = sorted(
         [c for c in candidates if c.odds.decimal_odds <= YANKEE_MAX_ODDS],
@@ -291,6 +297,14 @@ def main() -> None:
         print_coverage_bet("SUPER YANKEE (Canadian)", 26, yankee_pool[:5])
     else:
         print(f"\n  Not enough short-odds value bets for a Super Yankee (need 5, have {len(yankee_pool)}).")
+
+    # -----------------------------------------------------------------------
+    # Step 4: Full value bet list
+    # -----------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"  ALL VALUE BETS  ({len(candidates)} this week, edge ≥ 8%)")
+    print(f"{'='*60}\n")
+    print_candidates(candidates)
 
     print(f"\n{'='*60}")
     print("  REMINDER: This is a mathematical model. It finds statistical")

@@ -140,6 +140,36 @@ _NAME_OVERRIDES: Dict[str, str] = {
     "Wolverhampton Wanderers":   "Wolves",
     "Nottingham Forest":         "Nottm Forest",
     "Leicester":                 "Leicester City",
+    # football-data.co.uk Bundesliga 2 short names -> canonical (matches Odds API)
+    "Magdeburg":                 "1. FC Magdeburg",
+    "Bochum":                    "VfL Bochum",
+    "Bielefeld":                 "Arminia Bielefeld",
+    "Darmstadt":                 "SV Darmstadt 98",
+    "Kaiserslautern":            "1. FC Kaiserslautern",
+    "Fortuna Dusseldorf":        "Fortuna Düsseldorf",
+    "Dresden":                   "Dynamo Dresden",
+    "Hertha":                    "Hertha Berlin",
+    "Kiel":                      "Holstein Kiel",
+    "Braunschweig":              "Eintracht Braunschweig",
+    "Nurnberg":                  "1. FC Nürnberg",
+    "Nürnberg":                  "1. FC Nürnberg",
+    "Hannover":                  "Hannover 96",
+    "Karlsruhe":                 "Karlsruher",
+    "Hamburg":                   "Hamburger SV",
+    "Greuther Furth":            "Greuther Fürth",
+    # football-data.co.uk Serie B short names -> canonical
+    "Catanzaro":                 "US Catanzaro 1929",
+    "Entella":                   "Virtus Entella",
+    "Juve Stabia":               "Juve Stabia",     # identity — prevents prefix strip
+    "Sudtirol":                  "Südtirol",
+    # football-data.co.uk Ligue 2 short names -> canonical
+    "St Etienne":                "Saint Etienne",
+    "Saint-Etienne":             "Saint Etienne",
+    "Dunkerque":                 "USL Dunkerque",
+    "GFC Dunkerque":             "USL Dunkerque",
+    "Rodez":                     "Rodez AF",
+    "Laval":                     "Stade Lavallois",
+    "Reims":                     "Stade de Reims",
     # ClubElo names -> canonical
     "Bayern":                    "Bayern Munich",
     "Paris SG":                  "PSG",
@@ -563,6 +593,113 @@ def _apply_elo_factors(
 
 
 # ---------------------------------------------------------------------------
+# football-data.co.uk CSV client
+# Downloads current-season match results as CSV (free, no API key, no scraping).
+# Used to provide 2025/26 form data for European leagues not on football-data.org.
+# Cache TTL: 48 hours.
+# Covers: Bundesliga 2, Serie B, Ligue 2. Liga MX / Brazil not available here.
+# ---------------------------------------------------------------------------
+
+class FootballDataCoUkClient:
+    """
+    Downloads finished match results from football-data.co.uk CSV files.
+
+    Plain English: football-data.co.uk (not .org) is a free research site
+    that publishes CSV spreadsheets of match results for dozens of leagues.
+    No API key needed — just download and parse.
+    """
+
+    # football-data.co.uk league codes for 2025/26 season (folder: mmz4281/2526/)
+    LEAGUE_MAP: Dict[str, str] = {
+        "BUNDESLIGA2": "D2",
+        "SERIEB":      "I2",
+        "LIGUE2":      "F2",
+    }
+
+    BASE_URL = "https://www.football-data.co.uk/mmz4281/2526/{code}.csv"
+
+    def get_matches(self, league_id: str) -> List[dict]:
+        """
+        Return finished matches for the 2024/25 season.
+        Each dict: {date, home, away, home_goals, away_goals, competition}.
+        Returns [] if the league is not supported or the request fails.
+        """
+        import csv, io
+
+        code = self.LEAGUE_MAP.get(league_id)
+        if not code:
+            return []
+
+        cache_key = f"fdcouk_{league_id}_2526"
+        cached = _cache_load(cache_key, max_age_seconds=172800)  # 48 hours
+        if cached:
+            for m in cached["matches"]:
+                if isinstance(m["date"], str):
+                    m["date"] = datetime.fromisoformat(m["date"])
+            return cached["matches"]
+
+        try:
+            url = self.BASE_URL.format(code=code)
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+        except Exception:
+            return []
+
+        # football-data.co.uk CSVs are UTF-8; force decode to handle umlauts correctly
+        try:
+            text = r.content.decode("utf-8")
+        except UnicodeDecodeError:
+            text = r.content.decode("latin-1")
+
+        matches: List[dict] = []
+        try:
+            reader = csv.DictReader(io.StringIO(text))
+            for row in reader:
+                try:
+                    fthg = row.get("FTHG", "").strip()
+                    ftag = row.get("FTAG", "").strip()
+                    if not fthg or not ftag:
+                        continue
+                    date_str = row.get("Date", "").strip()
+                    if not date_str:
+                        continue
+                    # football-data.co.uk uses DD/MM/YY or DD/MM/YYYY
+                    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+                        try:
+                            match_date = datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc)
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        continue
+
+                    home = normalise_team_name(row.get("HomeTeam", "").strip())
+                    away = normalise_team_name(row.get("AwayTeam", "").strip())
+                    if not home or not away:
+                        continue
+
+                    matches.append({
+                        "date":        match_date.isoformat(),
+                        "home":        home,
+                        "away":        away,
+                        "home_goals":  int(fthg),
+                        "away_goals":  int(ftag),
+                        "competition": league_id,
+                    })
+                except (ValueError, KeyError):
+                    continue
+        except Exception:
+            return []
+
+        _cache_save(cache_key, {"matches": matches})
+        # Convert ISO strings back to datetime for the caller
+        for m in matches:
+            if isinstance(m["date"], str):
+                m["date"] = datetime.fromisoformat(m["date"])
+        return matches
+
+
+# ---------------------------------------------------------------------------
 # Understat xG client
 # Scrapes expected-goals data from understat.com (free, no API key).
 # Supports EPL, La Liga, Bundesliga, Serie A, Ligue 1.
@@ -758,14 +895,16 @@ class FormCalculator:
             key=lambda r: r["date"], reverse=True,
         )
 
-        def ewma(matches: List[dict], scored: bool, half_life: float) -> float:
+        def ewma(matches: List[dict], scored: bool, half_life: float, default_avg: float = 1.0) -> float:
             """
             Exponentially weighted average of goals, most-recent-first.
             weight_i = alpha^i  where  alpha = 0.5^(1/half_life)
             Returns raw goals per match (normalised to a multiplier by caller).
+            When no matches found, return the league average so the ratio becomes
+            1.0 — meaning "unknown team, assume league average" rather than below-average.
             """
             if not matches:
-                return 1.0  # will become 1.0/league_avg ≈ 1.0 below
+                return default_avg  # ratio(league_avg, league_avg) = 1.0 = assume average
             alpha = 0.5 ** (1.0 / half_life)
             total_w = 0.0
             total_g = 0.0
@@ -783,14 +922,14 @@ class FormCalculator:
             return team_avg / league_avg if league_avg > 0 else 1.0
 
         return TeamFeatures(
-            home_attack_long=  ratio(ewma(home_matches, scored=True,  half_life=self.long_half_life),  league_home_avg),
-            home_attack_short= ratio(ewma(home_matches, scored=True,  half_life=self.short_half_life), league_home_avg),
-            home_defence_long= ratio(ewma(home_matches, scored=False, half_life=self.long_half_life),  league_away_avg),
-            home_defence_short=ratio(ewma(home_matches, scored=False, half_life=self.short_half_life), league_away_avg),
-            away_attack_long=  ratio(ewma(away_matches, scored=True,  half_life=self.long_half_life),  league_away_avg),
-            away_attack_short= ratio(ewma(away_matches, scored=True,  half_life=self.short_half_life), league_away_avg),
-            away_defence_long= ratio(ewma(away_matches, scored=False, half_life=self.long_half_life),  league_home_avg),
-            away_defence_short=ratio(ewma(away_matches, scored=False, half_life=self.short_half_life), league_home_avg),
+            home_attack_long=  ratio(ewma(home_matches, scored=True,  half_life=self.long_half_life,  default_avg=league_home_avg), league_home_avg),
+            home_attack_short= ratio(ewma(home_matches, scored=True,  half_life=self.short_half_life, default_avg=league_home_avg), league_home_avg),
+            home_defence_long= ratio(ewma(home_matches, scored=False, half_life=self.long_half_life,  default_avg=league_away_avg), league_away_avg),
+            home_defence_short=ratio(ewma(home_matches, scored=False, half_life=self.short_half_life, default_avg=league_away_avg), league_away_avg),
+            away_attack_long=  ratio(ewma(away_matches, scored=True,  half_life=self.long_half_life,  default_avg=league_away_avg), league_away_avg),
+            away_attack_short= ratio(ewma(away_matches, scored=True,  half_life=self.short_half_life, default_avg=league_away_avg), league_away_avg),
+            away_defence_long= ratio(ewma(away_matches, scored=False, half_life=self.long_half_life,  default_avg=league_home_avg), league_home_avg),
+            away_defence_short=ratio(ewma(away_matches, scored=False, half_life=self.short_half_life, default_avg=league_home_avg), league_home_avg),
             strict_validation=strict_validation,
         )
 
@@ -1066,43 +1205,39 @@ def fetch_competition_af(
 ) -> List[Tuple[Match, List[Tuple[Market, OddsSnapshot]]]]:
     """
     Full pipeline for leagues sourced from API-Football (not football-data.org).
+    Current season form from football-data.co.uk CSVs (Bundesliga 2, Serie B, Ligue 2)
+    or empty list for unsupported leagues (Liga MX, Brazil).
+    Historical H2H from API-Football 2024.
+    Upcoming fixtures inferred from Odds API events.
     Same output format as fetch_competition().
     """
     calc = FormCalculator()
 
-    # Form data — current season
-    raw_finished = af_client.get_finished_matches(af_league_id, season)
-    if not raw_finished:
-        raw_finished = af_client.get_finished_matches(af_league_id, season - 1)
-    parsed = [af_client.parse_result(m) for m in raw_finished]
-    parsed = [p for p in parsed if p is not None]
+    # Form data — current season from football-data.co.uk CSVs
+    parsed = FootballDataCoUkClient().get_matches(league_id)
 
-    league_home_avg, league_away_avg = calc.league_averages(parsed)
-
-    # H2H pool — add previous season
+    # H2H pool — add previous season from API-Football (2024 data available on free tier)
     raw_prev = af_client.get_finished_matches(af_league_id, season - 1)
     parsed_prev = [af_client.parse_result(m) for m in raw_prev]
     h2h_pool = parsed + [p for p in parsed_prev if p is not None]
+    league_home_avg, league_away_avg = calc.league_averages(parsed)
 
-    # Upcoming fixtures
-    raw_upcoming = af_client.get_upcoming_fixtures(af_league_id, season, days_ahead=days_ahead)
-
-    # Odds
+    # Upcoming fixtures + odds — use Odds API events as the fixture source
     odds_events = odds_client.get_odds(odds_sport_key)
-    odds_lookup: Dict[Tuple[str, str], dict] = {}
-    for ev in odds_events:
-        h = normalise_team_name(ev.get("home_team", ""))
-        a = normalise_team_name(ev.get("away_team", ""))
-        odds_lookup[(h, a)] = ev
 
     output: List[Tuple[Match, List[Tuple[Market, OddsSnapshot]]]] = []
-    data_quality = 0.75
 
-    for raw in raw_upcoming:
+    # Data quality: better when we have a full season's worth of results.
+    # 200+ matches = most of the season played = treat same as established leagues.
+    data_quality = 0.80 if len(parsed) >= 200 else (0.75 if len(parsed) >= 50 else 0.65)
+
+    for ev in odds_events:
         try:
-            home = normalise_team_name(raw["teams"]["home"]["name"])
-            away = normalise_team_name(raw["teams"]["away"]["name"])
-            kickoff = datetime.fromisoformat(raw["fixture"]["date"].replace("Z", "+00:00"))
+            home = normalise_team_name(ev.get("home_team", ""))
+            away = normalise_team_name(ev.get("away_team", ""))
+            kickoff = datetime.fromisoformat(
+                ev.get("commence_time", "").replace("Z", "+00:00")
+            )
         except (KeyError, ValueError):
             continue
 
@@ -1112,7 +1247,7 @@ def fetch_competition_af(
         away_sched = build_schedule_context(away, kickoff, parsed)
 
         match = Match(
-            match_id=str(raw.get("fixture", {}).get("id", f"{league_id}_{home}_{away}")),
+            match_id=f"{league_id}_{home}_{away}",
             league=league_id,
             kickoff_utc=kickoff,
             home_team=home,
@@ -1123,21 +1258,21 @@ def fetch_competition_af(
             away_schedule=away_sched,
             h2h_home_edge=compute_h2h_edge(home, away, h2h_pool),
             league_data_quality=data_quality,
+            actual_home_avg=league_home_avg,
+            actual_away_avg=league_away_avg,
         )
 
         market_odds: List[Tuple[Market, OddsSnapshot]] = []
-        ev = odds_lookup.get((home, away))
-        if ev:
-            for sel in ("HOME", "DRAW", "AWAY"):
-                snap = best_odds_for_selection(ev, "1X2", sel, bookmaker_filter=bookmaker_filter)
-                if snap:
-                    market_odds.append((Market(kind="1X2", selection=sel), snap))
-            for sel in ("OVER", "UNDER"):
-                snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=bookmaker_filter)
-                if snap is None and bookmaker_filter:
-                    snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=None)
-                if snap:
-                    market_odds.append((Market(kind="OVER_UNDER", line=2.5, selection=sel), snap))
+        for sel in ("HOME", "DRAW", "AWAY"):
+            snap = best_odds_for_selection(ev, "1X2", sel, bookmaker_filter=bookmaker_filter)
+            if snap:
+                market_odds.append((Market(kind="1X2", selection=sel), snap))
+        for sel in ("OVER", "UNDER"):
+            snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=bookmaker_filter)
+            if snap is None and bookmaker_filter:
+                snap = best_odds_for_selection(ev, "OVER_UNDER", sel, line=2.5, bookmaker_filter=None)
+            if snap:
+                market_odds.append((Market(kind="OVER_UNDER", line=2.5, selection=sel), snap))
 
         output.append((match, market_odds))
 
